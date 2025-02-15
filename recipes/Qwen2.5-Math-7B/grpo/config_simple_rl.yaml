@@ -1,15 +1,32 @@
 # Model arguments
-model_name_or_path: Qwen/Qwen2.5-Math-7B
+wandb_entity: andy279
+wandb_project: aimo
+model_name_or_path: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
 model_revision: main
 torch_dtype: bfloat16
 attn_implementation: flash_attention_2
+use_liger_kernel: true
 
 # Data training arguments
-dataset_name: DigitalLearningGmbH/MATH-lighteval
+dataset_name: open-r1/OpenR1-Math-220k
 dataset_configs:
 - train
 # Num processes is less by 1 as vLLM is using 1 GPU
 num_processes: 7
+
+use_peft: true
+lora_task_type: CAUSAL_LM
+lora_r: 256
+lora_alpha: 16
+lora_dropout: 0.05
+lora_target_modules:
+- q_proj
+- v_proj
+- k_proj
+- o_proj
+- gate_proj
+- up_proj
+- down_proj
 
 # GRPO trainer config
 bf16: true
@@ -31,7 +48,7 @@ logging_steps: 5
 logging_strategy: steps
 lr_scheduler_type: cosine
 max_prompt_length: 512
-max_completion_length: 1024
+max_completion_length: 8192
 max_steps: -1
 num_generations: 7
 num_train_epochs: 1
