@@ -8,27 +8,26 @@ class LigerFusedLinearRLHFBase(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
-        _input,
+        inputs,
         weight,
+        input_ids,
         attention_mask,
-        rewards,
+        advantages,
         bias=None,
         loss_fn=None,
-        num_generations=1,
         beta=0.1,
         compiled=True,
-        use_ref_model=False,
-        ref_input=None,
+        ref_inputs=None,
         ref_weight=None,
         ref_bias=None,
     ):
         """Chunked forward pass for RLHF loss computation."""
         # Save for backward
         ctx.beta = beta
-        ctx.rewards = rewards
+        ctx.advantages = advantages
 
         # Initialize accumulators
-        loss_acc = torch.zeros((), device=_input.device)
+        loss_acc = torch.zeros((), device=inputs.device)
         grad_weight = torch.zeros_like(weight)  # [V, H]
         grad_inputs = []
         grad_bias = torch.zeros_like(bias) if bias is not None else None  # [V]
@@ -38,63 +37,67 @@ class LigerFusedLinearRLHFBase(torch.autograd.Function):
         compute_loss = partial(
             LigerFusedLinearRLHFBase._compute_chunk_loss,
             beta=beta,
-            use_ref_model=use_ref_model,
             ref_weight=ref_weight,
             ref_bias=ref_bias,
             rlhf_loss_fn=loss_fn,
         )
 
         def fused_fwd_bwd(
-            input_chunk, attention_mask_chunk, rewards_chunk, ref_input_chunk
+            inputs_chunk,
+            input_ids_chunk,
+            attention_mask_chunk,
+            advantages_chunk,
+            ref_inputs_chunk,
         ):
             """Fused forward and backward for a chunk."""
             if bias is not None:
                 return torch.func.grad_and_value(
-                    compute_loss, argnums=(0, 1, 5), has_aux=True
+                    compute_loss, argnums=(0, 1, 6), has_aux=True
                 )(
-                    input_chunk,  # arg 0
+                    inputs_chunk,  # arg 0
                     weight,  # arg 1
-                    attention_mask_chunk,  # arg 2
-                    rewards_chunk,  # arg 3
-                    ref_input_chunk,  # arg 4
-                    bias,  # arg 5
+                    input_ids_chunk,  # arg 2
+                    attention_mask_chunk,  # arg 3
+                    advantages_chunk,  # arg 4
+                    ref_inputs_chunk,  # arg 5
+                    bias,  # arg 6
                 )
             else:
                 return torch.func.grad_and_value(
-                    compute_loss, argnums=(0, 1), has_aux=True
+                    compute_loss, argnums=(0, 1, 5), has_aux=True
                 )(
-                    input_chunk,  # arg 0
+                    inputs_chunk,  # arg 0
                     weight,  # arg 1
-                    attention_mask_chunk,  # arg 2
-                    rewards_chunk,  # arg 3
-                    ref_input_chunk,  # arg 4
+                    input_ids_chunk,  # arg 2
+                    attention_mask_chunk,  # arg 3
+                    advantages_chunk,  # arg 4
+                    ref_inputs_chunk,  # arg 5
                 )
 
         def accumulate_chunk(
-            input_chunk, attention_mask_chunk, rewards_chunk, ref_input_chunk=None
+            inputs_chunk,
+            input_ids_chunk,
+            attention_mask_chunk,
+            advantages_chunk,
+            ref_inputs_chunk=None,
         ):
-            if bias is not None:
-                (chunk_grad_input, chunk_grad_weight, chunk_grad_bias), (
-                    chunk_loss,
-                    chunk_metrics,
-                ) = fused_fwd_bwd(
-                    input_chunk, attention_mask_chunk, rewards_chunk, ref_input_chunk
-                )
-                grad_bias.add_(chunk_grad_bias)
-            else:
-                (chunk_grad_input, chunk_grad_weight), (chunk_loss, chunk_metrics) = (
-                    fused_fwd_bwd(
-                        input_chunk,
-                        attention_mask_chunk,
-                        rewards_chunk,
-                        ref_input_chunk,
-                    )
-                )
+            (chunk_grads, (chunk_loss, chunk_metrics)) = fused_fwd_bwd(
+                inputs_chunk,
+                input_ids_chunk,
+                attention_mask_chunk,
+                advantages_chunk,
+                ref_inputs_chunk,
+            )
+            chunk_grad_input = chunk_grads[0]
+            chunk_grad_weight = chunk_grads[1]
 
             # Accumulate gradients and loss
             grad_weight.add_(chunk_grad_weight)
             grad_inputs.append(chunk_grad_input)
             loss_acc.add_(chunk_loss)
+            if bias is not None:
+                chunk_grad_bias = chunk_grads[2]
+                grad_bias.add_(chunk_grad_bias)
 
             # Initialize storage for metrics on first chunk
             if len(aggregated_metrics) == 0:
@@ -115,37 +118,48 @@ class LigerFusedLinearRLHFBase(torch.autograd.Function):
             accumulate_chunk = torch.compile(accumulate_chunk)
 
         # Process input in chunks
-        chunks = max(1, _input.shape[0] // num_generations)
-        _input_chunks = torch.chunk(_input, chunks=chunks, dim=0)
-        _attention_mask_chunks = torch.chunk(attention_mask, chunks=chunks, dim=0)
-        _rewards_chunks = torch.chunk(rewards, chunks=chunks, dim=0)
-        _ref_input_chunks = (
-            torch.chunk(ref_input, chunks=chunks, dim=0)
-            if use_ref_model
-            else [None] * chunks
-        )
+        chunks = inputs.shape[0]
+        input_chunks = torch.chunk(inputs, chunks=chunks, dim=0)
+        input_ids_chunks = torch.chunk(input_ids, chunks=chunks, dim=0)
+        attention_mask_chunks = torch.chunk(attention_mask, chunks=chunks, dim=0)
+        advantages_chunks = torch.chunk(advantages, chunks=chunks, dim=0)
+        ref_input_chunks = torch.chunk(ref_inputs, chunks=chunks, dim=0)
 
-        for input_chunk, attention_mask_chunk, rewards_chunk, ref_input_chunk in zip(
-            _input_chunks, _attention_mask_chunks, _rewards_chunks, _ref_input_chunks
+        for (
+            input_chunk,
+            input_ids_chunk,
+            attention_mask_chunk,
+            advantages_chunk,
+            ref_input_chunk,
+        ) in zip(
+            input_chunks,
+            input_ids_chunks,
+            attention_mask_chunks,
+            advantages_chunks,
+            ref_input_chunks,
         ):
-            # Mark dynamic dimensions
             torch._dynamo.mark_dynamic(input_chunk, 1)
+            torch._dynamo.mark_dynamic(input_ids_chunk, 1)
             torch._dynamo.mark_dynamic(attention_mask_chunk, 1)
-            if ref_input_chunk is not None:
-                torch._dynamo.mark_dynamic(ref_input_chunk, 1)
-
+            torch._dynamo.mark_dynamic(advantages_chunk, 1)
+            torch._dynamo.mark_dynamic(ref_input_chunk, 1)
             accumulate_chunk(
-                input_chunk, attention_mask_chunk, rewards_chunk, ref_input_chunk
+                input_chunk,
+                input_ids_chunk,
+                attention_mask_chunk,
+                advantages_chunk,
+                ref_input_chunk,
             )
 
         # Scale accumulated loss by number of chunks since we're averaging
         loss_acc = loss_acc / chunks
 
-        # Combine gradients
-        grad_input = torch.cat(grad_inputs, dim=0)
-
         # Save for backward
-        ctx.save_for_backward(grad_input, grad_weight, grad_bias)
+        ctx.save_for_backward(
+            torch.cat(grad_inputs, dim=0) / chunks,
+            grad_weight / chunks,
+            grad_bias / chunks if bias is not None else None,
+        )
 
         # Finalize metrics
         final_metrics = []
@@ -159,84 +173,66 @@ class LigerFusedLinearRLHFBase(torch.autograd.Function):
 
     @staticmethod
     def _compute_chunk_loss(
-        input_chunk,
+        inputs_chunk,
         weight,
+        input_ids_chunk,
         attention_mask_chunk,
-        rewards_chunk,
-        ref_input_chunk=None,
+        advantages_chunk,
+        ref_inputs_chunk=None,
         bias=None,
-        beta=0.1,
-        use_ref_model=False,
+        beta=0.04,
         ref_weight=None,
         ref_bias=None,
         rlhf_loss_fn=None,
     ):
         """Compute loss for a single chunk."""
         # Get policy log probabilities using chunk_forward
-        log_probs, _, logits_mean = LigerFusedLinearRLHFBase.chunk_forward(
-            input_chunk, weight, bias=bias
+        logits, logits_mean = LigerFusedLinearRLHFBase.chunk_forward(
+            inputs_chunk, weight, bias=bias
         )
 
         # Get reference log probabilities if needed
-        ref_log_probs = None
-        if use_ref_model and ref_input_chunk is not None:
-            with torch.no_grad():
-                ref_log_probs, _, _ = LigerFusedLinearRLHFBase.chunk_forward(
-                    ref_input_chunk, ref_weight, bias=ref_bias
-                )
+        with torch.no_grad():
+            ref_logits, _ = LigerFusedLinearRLHFBase.chunk_forward(
+                ref_inputs_chunk, ref_weight, bias=ref_bias
+            )
 
         # Compute chunk loss and metrics using the provided loss function
         chunk_loss, chunk_metrics = rlhf_loss_fn(
-            log_probs=log_probs,
+            logits=logits,
+            input_ids=input_ids_chunk,
             attention_mask=attention_mask_chunk,
-            rewards=rewards_chunk,
-            ref_log_probs=ref_log_probs,
+            advantages=advantages_chunk,
+            ref_logits=ref_logits,
             beta=beta,
         )
 
         return chunk_loss, (logits_mean, *chunk_metrics)
 
     @staticmethod
-    def chunk_forward(input_chunk, weight, bias=None):
+    def chunk_forward(inputs_chunk, weight, bias=None):
         """Forward pass computation for a single chunk."""
-        batch_size, seq_len, hidden_size = input_chunk.shape
-        input_reshaped = input_chunk.view(-1, hidden_size)  # [B*T, H]
-
-        # Linear layer: [B*T, H] @ [H, V] -> [B*T, V]
-        logits = F.linear(input_reshaped, weight)  # weight shape is [V, H]
+        logits = F.linear(inputs_chunk, weight)
         if bias is not None:
             logits = logits + bias.view(1, -1)
 
-        # Reshape to [B, T, V] and compute log_probs
-        logits = logits.view(batch_size, seq_len, -1)
-        log_probs = F.log_softmax(logits.float(), dim=-1)
-
-        # Calculate mean logits for monitoring
-        logits_mean = logits.sum() / (batch_size * seq_len * weight.shape[0])
-
-        return log_probs, logits, logits_mean
+        return logits, logits.mean()
 
     @staticmethod
     def backward(ctx, grad_output, *grad_metrics):
         """Backward pass for RLHF loss."""
         grad_input, grad_weight, grad_bias = ctx.saved_tensors
-        if grad_output != 1.0:
-            grad_input = grad_input * grad_output
-            grad_weight = grad_weight * grad_output
-            if grad_bias is not None:
-                grad_bias = grad_bias * grad_output
 
         return (
             grad_input,
             grad_weight,
+            None,  # grad_input_ids
             None,  # grad_attention_mask
-            None,  # grad_rewards
+            None,  # grad_advantages
             grad_bias,
             None,  # grad_loss_fn
-            None,  # grad_chunk_size
             None,  # grad_beta
             None,  # grad_compiled
-            None,  # grad_use_ref_model
             None,  # grad_ref_input
             None,  # grad_ref_weight
             None,  # grad_ref_bias

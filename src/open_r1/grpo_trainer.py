@@ -78,8 +78,6 @@ if is_vllm_available():
 if is_wandb_available():
     import wandb
 
-from open_r1.grpo_loss import LigerFusedLinearGRPOLoss
-
 # What we call a reward function is a callable that takes a list of prompts and completions and returns a list of
 # rewards. When it's a string, it's a model ID, so it's loaded as a pretrained model.
 RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
@@ -280,8 +278,6 @@ class GRPOTrainer(Trainer):
                     "This argument can only be used when the `model` argument is a string."
                 )
 
-        model.forward = forward.__get__(model, type(model))
-
         if peft_config is not None:
             model = get_peft_model(model, peft_config)
 
@@ -297,11 +293,6 @@ class GRPOTrainer(Trainer):
             # If PEFT is used, the reference model is not needed since the adapter can be disabled
             # to revert to the initial model.
             self.ref_model = None
-
-        if self.ref_model is not None:
-            self.ref_model.forward = forward.__get__(
-                self.ref_model, type(self.ref_model)
-            )
 
         # Processing class
         if processing_class is None:
@@ -485,6 +476,7 @@ class GRPOTrainer(Trainer):
                         # This is particularly useful here because we generate completions from the same prompts.
                         enable_prefix_caching=True,
                         max_model_len=self.args.vllm_max_model_len,
+                        enforce_eager=True,
                     )
                 self.sampling_params = SamplingParams(
                     temperature=args.temperature,
@@ -714,9 +706,9 @@ class GRPOTrainer(Trainer):
         # Concatenate prompt_mask with completion_mask for logit computation
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  # (B*G, P+C)
 
-        # logits_to_keep = completion_ids.size(
-        #     1
-        # )  # we only need to compute the logits for the completion tokens
+        logits_to_keep = completion_ids.size(
+            1
+        )  # we only need to compute the logits for the completion tokens
 
         # with torch.inference_mode():
         #     if self.ref_model is not None:
@@ -804,27 +796,25 @@ class GRPOTrainer(Trainer):
             dim=1
         )
 
-        # # Compute grouped-wise rewards
-        # mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
+        # Compute grouped-wise rewards
+        mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
         std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
 
-        # # Normalize the rewards to compute the advantages
-        # mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(
-        #     self.num_generations, dim=0
-        # )
+        # Normalize the rewards to compute the advantages
+        mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(
+            self.num_generations, dim=0
+        )
         std_grouped_rewards = std_grouped_rewards.repeat_interleave(
             self.num_generations, dim=0
         )
-        # advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
+        advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
 
         # Slice to keep only the local part of the data
         process_slice = slice(
             self.accelerator.process_index * len(prompts),
             (self.accelerator.process_index + 1) * len(prompts),
         )
-        # advantages = advantages[process_slice]
-        rewards = rewards[process_slice]
-        std_grouped_rewards = std_grouped_rewards[process_slice]
+        advantages = advantages[process_slice]
 
         # Log the metrics
         reward_per_func = rewards_per_func.mean(0)
@@ -861,14 +851,23 @@ class GRPOTrainer(Trainer):
             if wandb.run is not None and self.accelerator.is_main_process:
                 wandb.log({"completions": wandb.Table(dataframe=df)})
 
+        import pandas as pd
+
         return {
             "prompt_ids": prompt_ids,
             "prompt_mask": prompt_mask,
             "completion_ids": completion_ids,
             "completion_mask": completion_mask,
             # "ref_per_token_logps": ref_per_token_logps,
-            # "advantages": advantages,
-            "rewards": rewards,
+            "advantages": advantages,
+            "df": pd.DataFrame(
+                {
+                    "step": [str(self.state.global_step)] * len(rewards),
+                    "prompt": gather_object(prompts_text),
+                    "completion": gather_object(completions_text),
+                    "reward": rewards.tolist(),
+                }
+            ),
         }
 
     def compute_loss(
@@ -889,58 +888,33 @@ class GRPOTrainer(Trainer):
             1
         )  # we only need to compute the logits for the completion tokens
 
-        loss_fn = LigerFusedLinearGRPOLoss(
-            self.beta, compiled=True, num_generations=self.num_generations
-        )
-        hidden_states = model(
-            input_ids, attention_mask, output_hidden_states=True
-        ).hidden_states[-1]
-        with torch.inference_mode():
-            if self.ref_model is not None:
-                ref_hidden_states = self.ref_model(
-                    input_ids, attention_mask, output_hidden_states=True
-                ).hidden_states[-1]
-            else:
-                with self.accelerator.unwrap_model(self.model).disable_adapter():
-                    ref_hidden_states = self.model(
-                        input_ids, attention_mask, output_hidden_states=True
-                    ).hidden_states[-1]
+        df = inputs["df"]
+        df.prompt = df.prompt.apply(lambda x: x.split("<｜User｜>")[1])
+        import pdb
 
-        weight = self.accelerator.unwrap_model(model).lm_head.weight
-        if self.ref_model is not None:
-            ref_weight = self.accelerator.unwrap_model(self.ref_model).lm_head.weight
-        else:
-            ref_weight = weight
-        loss, metrics = loss_fn(
-            weight,
-            hidden_states,
-            attention_mask,
-            inputs["rewards"],
-            ref_input=ref_hidden_states,
-            ref_weight=ref_weight,
+        pdb.set_trace()
+
+        per_token_logps = self._get_per_token_logps(
+            model, input_ids, attention_mask, logits_to_keep
         )
 
-        # per_token_logps = self._get_per_token_logps(
-        #     model, input_ids, attention_mask, logits_to_keep
-        # )
+        # Compute the KL divergence between the model and the reference model
+        ref_per_token_logps = inputs["ref_per_token_logps"]
+        per_token_kl = (
+            torch.exp(ref_per_token_logps - per_token_logps)
+            - (ref_per_token_logps - per_token_logps)
+            - 1
+        )
 
-        # # Compute the KL divergence between the model and the reference model
-        # ref_per_token_logps = inputs["ref_per_token_logps"]
-        # per_token_kl = (
-        #     torch.exp(ref_per_token_logps - per_token_logps)
-        #     - (ref_per_token_logps - per_token_logps)
-        #     - 1
-        # )
-
-        # # x - x.detach() allows for preserving gradients from x
-        # advantages = inputs["advantages"]
-        # per_token_loss = torch.exp(
-        #     per_token_logps - per_token_logps.detach()
-        # ) * advantages.unsqueeze(1)
-        # per_token_loss = -(per_token_loss - self.beta * per_token_kl)
-        # loss = (
-        #     (per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)
-        # ).mean()
+        # x - x.detach() allows for preserving gradients from x
+        advantages = inputs["advantages"]
+        per_token_loss = torch.exp(
+            per_token_logps - per_token_logps.detach()
+        ) * advantages.unsqueeze(1)
+        per_token_loss = -(per_token_loss - self.beta * per_token_kl)
+        loss = (
+            (per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)
+        ).mean()
 
         # Log the metrics
         completion_length = (
@@ -951,14 +925,12 @@ class GRPOTrainer(Trainer):
         )
         self._metrics["completion_length"].append(completion_length)
 
-        # mean_kl = (
-        #     (per_token_kl * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)
-        # ).mean()
-        # self._metrics["kl"].append(
-        #     self.accelerator.gather_for_metrics(mean_kl).mean().item()
-        # )
-
-        self._metrics["kl"].append(metrics[3].item())
+        mean_kl = (
+            (per_token_kl * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)
+        ).mean()
+        self._metrics["kl"].append(
+            self.accelerator.gather_for_metrics(mean_kl).mean().item()
+        )
 
         return loss
 
@@ -1057,63 +1029,3 @@ class GRPOTrainer(Trainer):
         )
 
         model_card.save(os.path.join(self.args.output_dir, "README.md"))
-
-
-from typing import Optional, List, Union, Tuple
-import torch.nn.functional as F
-from transformers.modeling_outputs import CausalLMOutputWithPast
-from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
-
-
-def forward(
-    self: Qwen2ForCausalLM,
-    input_ids: torch.LongTensor = None,
-    attention_mask: Optional[torch.Tensor] = None,
-    position_ids: Optional[torch.LongTensor] = None,
-    past_key_values: Optional[List[torch.FloatTensor]] = None,
-    inputs_embeds: Optional[torch.FloatTensor] = None,
-    teacher_scores: Optional[torch.FloatTensor] = None,
-    labels: Optional[torch.LongTensor] = None,
-    use_cache: Optional[bool] = None,
-    output_attentions: Optional[bool] = None,
-    output_hidden_states: Optional[bool] = None,
-    return_dict: Optional[bool] = None,
-    cache_position: Optional[torch.LongTensor] = None,
-    num_logits_to_keep: int = 0,
-    **loss_kwargs,
-) -> Union[Tuple, CausalLMOutputWithPast]:
-    output_attentions = (
-        output_attentions
-        if output_attentions is not None
-        else self.config.output_attentions
-    )
-    output_hidden_states = (
-        output_hidden_states
-        if output_hidden_states is not None
-        else self.config.output_hidden_states
-    )
-    return_dict = (
-        return_dict if return_dict is not None else self.config.use_return_dict
-    )
-
-    # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-    outputs = self.model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        position_ids=position_ids,
-        past_key_values=past_key_values,
-        inputs_embeds=inputs_embeds,
-        use_cache=use_cache,
-        output_attentions=output_attentions,
-        output_hidden_states=output_hidden_states,
-        return_dict=return_dict,
-        cache_position=cache_position,
-    )
-
-    return CausalLMOutputWithPast(
-        loss=None,
-        logits=None,
-        past_key_values=outputs.past_key_values,
-        hidden_states=outputs.hidden_states,
-        attentions=outputs.attentions,
-    )

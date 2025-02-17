@@ -1,5 +1,6 @@
 """Reward functions for GRPO training."""
 
+from functools import partial
 import math
 import re
 from typing import Dict
@@ -8,37 +9,39 @@ from latex2sympy2_extended import NormalizationConfig
 from math_verify import LatexExtractionConfig, parse, verify
 
 
+answer_parser = partial(
+    parse,
+    extraction_config=[
+        LatexExtractionConfig(
+            normalization_config=NormalizationConfig(
+                nits=False,
+                malformed_operators=False,
+                basic_latex=True,
+                equations=True,
+                boxed="all",
+                units=True,
+            ),
+            # Ensures that boxed is tried first
+            boxed_match_priority=0,
+            try_extract_without_anchor=False,
+        )
+    ],
+    extraction_mode="first_match",
+)
+solution_parser = partial(
+    parse, extraction_config=[LatexExtractionConfig()], extraction_mode="first_match"
+)
+
+
 def accuracy_reward(completions, solution, **kwargs):
     """Reward function that checks if the completion is the same as the ground truth."""
     contents = [completion[0]["content"] for completion in completions]
     rewards = []
     for content, sol in zip(contents, solution):
-        gold_parsed = parse(
-            sol,
-            extraction_mode="first_match",
-            extraction_config=[LatexExtractionConfig()],
-        )
+        gold_parsed = solution_parser(sol)
         if len(gold_parsed) != 0:
             # We require the answer to be provided in correct latex (no malformed operators)
-            answer_parsed = parse(
-                content,
-                extraction_config=[
-                    LatexExtractionConfig(
-                        normalization_config=NormalizationConfig(
-                            nits=False,
-                            malformed_operators=False,
-                            basic_latex=True,
-                            equations=True,
-                            boxed="all",
-                            units=True,
-                        ),
-                        # Ensures that boxed is tried first
-                        boxed_match_priority=0,
-                        try_extract_without_anchor=False,
-                    )
-                ],
-                extraction_mode="first_match",
-            )
+            answer_parsed = answer_parser(content)
             # Reward 1 if the content is the same as the ground truth, 0 otherwise
             reward = float(verify(answer_parsed, gold_parsed))
         else:
