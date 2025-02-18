@@ -47,7 +47,7 @@ def accuracy_reward(completions, solution, **kwargs):
         else:
             # If the gold solution is not parseable, we reward 1 to skip this example
             reward = 1.0
-            print("Failed to parse gold solution: ", sol)
+            # print("Failed to parse gold solution: ", sol)
         rewards.append(reward)
 
     return rewards
@@ -55,15 +55,30 @@ def accuracy_reward(completions, solution, **kwargs):
 
 def format_reward(completions, **kwargs):
     """Reward function that checks if the completion has a specific format."""
-    pattern = r"<think>.*?</think>\s*<answer>.*?</answer>"
+    # pattern = r"^<think>.*?</think>\s*<answer>.*?</answer>$"
     completion_contents = [
         "<think>" + completion[0]["content"] for completion in completions
     ]
-    matches = [
-        re.match(pattern, content, re.DOTALL | re.MULTILINE)
-        for content in completion_contents
-    ]
-    return [1.0 if match else 0.0 for match in matches]
+    # matches = [
+    #     re.match(pattern, content, re.DOTALL | re.MULTILINE)
+    #     for content in completion_contents
+    # ]
+    # return [1.0 if match else 0.0 for match in matches]
+    rewards = []
+    for content in completion_contents:
+        if (
+            "<think>" in content
+            and "</think>" in content
+            and "<answer>" in content
+            and "</answer>" in content
+        ):
+            if content.startswith("<think>") and content.endswith("</answer>"):
+                rewards.append(1.0)
+            else:
+                rewards.append(0.0)
+        else:
+            rewards.append(0.0)
+    return rewards
 
 
 def reasoning_steps_reward(completions, **kwargs):
@@ -83,7 +98,9 @@ def reasoning_steps_reward(completions, **kwargs):
     return [min(1.0, count / 3) for count in matches]
 
 
-def len_reward(completions: list[Dict[str, str]], solutions: list[str], **kwargs) -> float:
+def len_reward(
+    completions: list[Dict[str, str]], solutions: list[str], **kwargs
+) -> float:
     """Compute length-based rewards to discourage overthinking and promote token efficiency.
 
     Taken from from the Kimi 1.5 tech report: https://arxiv.org/abs/2501.12599
