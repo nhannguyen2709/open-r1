@@ -1,7 +1,6 @@
 # Model arguments
 wandb_entity: andy279
 wandb_project: aimo
-model_name_or_path: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
 model_revision: main
 torch_dtype: bfloat16
 attn_implementation: flash_attention_2
@@ -28,37 +27,42 @@ lora_target_modules:
 - up_proj
 - down_proj
 
-# GRPO trainer config
+warmup_ratio: 0.05
+gradient_accumulation_steps: 8
+learning_rate: 1.0e-4
+logging_steps: 1
+num_generations: 7
+max_prompt_length: 512
+max_completion_length: 4096
+per_device_eval_batch_size: 16
+per_device_train_batch_size: 16
+model_name_or_path: deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+output_dir: data/Qwen-2.5-1.5B-Simple-RL
+hub_model_id: Qwen-2.5-1.5B-Simple-RL
+hub_strategy: every_save
+num_train_epochs: 1
+overwrite_output_dir: true
+temperature: 0.6
 bf16: true
 use_vllm: true
 vllm_device: auto
-vllm_gpu_memory_utilization: 0.7
+vllm_gpu_memory_utilization: 0.9
+
+# GRPO trainer config
 do_eval: true
 eval_strategy: steps
 eval_steps: 100
-gradient_accumulation_steps: 8
 gradient_checkpointing: true
 gradient_checkpointing_kwargs:
   use_reentrant: false
-hub_model_id: Qwen-2.5-7B-Simple-RL
-hub_strategy: every_save
-learning_rate: 3.0e-06
+
 log_level: info
-logging_steps: 5
 logging_strategy: steps
 lr_scheduler_type: cosine
-max_prompt_length: 512
-max_completion_length: 8192
 max_steps: -1
-num_generations: 7
-num_train_epochs: 1
-output_dir: data/Qwen-2.5-7B-Simple-RL
-overwrite_output_dir: true
-per_device_eval_batch_size: 16
-per_device_train_batch_size: 16
+
 push_to_hub: true
 report_to:
 - wandb
 save_strategy: "no"
 seed: 42
-warmup_ratio: 0.1
