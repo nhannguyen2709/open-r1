@@ -178,6 +178,12 @@ def main(script_args, training_args, model_args):
         if "messages" in dataset[split].column_names:
             dataset[split] = dataset[split].remove_columns("messages")
 
+    train_dataset = dataset[script_args.dataset_train_split]
+    train_dataset = train_dataset.filter(
+        lambda x: any(x["correctness_math_verify"]) and x["question_type"] != "MCQ",
+        num_proc=16,
+    )
+
     logger.info("*** Initializing model kwargs ***")
     torch_dtype = (
         model_args.torch_dtype
@@ -200,7 +206,7 @@ def main(script_args, training_args, model_args):
         model=model_args.model_name_or_path,
         reward_funcs=reward_funcs,
         args=training_args,
-        train_dataset=dataset[script_args.dataset_train_split],
+        train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         peft_config=get_peft_config(model_args),
         callbacks=get_callbacks(training_args, model_args),

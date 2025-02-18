@@ -16,6 +16,7 @@ import os
 import textwrap
 import warnings
 from collections import defaultdict
+import time
 from typing import Any, Callable, Optional, Sized, Union
 from unittest.mock import patch
 
@@ -77,6 +78,9 @@ if is_vllm_available():
 
 if is_wandb_available():
     import wandb
+
+from open_r1.grpo_loss import LigerFusedLinearGRPOLoss
+from open_r1.monkey_patch import forward_hidden_states
 
 # What we call a reward function is a callable that takes a list of prompts and completions and returns a list of
 # rewards. When it's a string, it's a model ID, so it's loaded as a pretrained model.
@@ -278,6 +282,8 @@ class GRPOTrainer(Trainer):
                     "This argument can only be used when the `model` argument is a string."
                 )
 
+        model.forward = forward_hidden_states.__get__(model, type(model))
+
         if peft_config is not None:
             model = get_peft_model(model, peft_config)
 
@@ -293,6 +299,11 @@ class GRPOTrainer(Trainer):
             # If PEFT is used, the reference model is not needed since the adapter can be disabled
             # to revert to the initial model.
             self.ref_model = None
+
+        if self.ref_model is not None:
+            self.ref_model.forward = forward_hidden_states.__get__(
+                self.ref_model, type(self.ref_model)
+            )
 
         # Processing class
         if processing_class is None:
@@ -476,7 +487,7 @@ class GRPOTrainer(Trainer):
                         # This is particularly useful here because we generate completions from the same prompts.
                         enable_prefix_caching=True,
                         max_model_len=self.args.vllm_max_model_len,
-                        enforce_eager=True,
+                        enforce_eager=False,
                     )
                 self.sampling_params = SamplingParams(
                     temperature=args.temperature,
@@ -527,6 +538,11 @@ class GRPOTrainer(Trainer):
                 self.reward_funcs[i] = self.accelerator.prepare_model(
                     reward_func, evaluation_mode=True
                 )
+
+        self.loss_fn = LigerFusedLinearGRPOLoss(
+            beta=self.beta,
+            compiled=True,
+        )
 
     def _set_signature_columns_if_needed(self):
         # If `self.args.remove_unused_columns` is True, non-signature columns are removed.
@@ -647,6 +663,7 @@ class GRPOTrainer(Trainer):
             # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
             all_prompts_text = gather_object(prompts_text)
             if self.accelerator.is_main_process:
+                generation_start_time = time.time()
                 outputs = self.llm.generate(
                     all_prompts_text,
                     sampling_params=self.sampling_params,
@@ -657,6 +674,9 @@ class GRPOTrainer(Trainer):
                     for completions in outputs
                     for out in completions.outputs
                 ]
+                self._metrics["generation_time"].append(
+                    round(time.time() - generation_start_time, 2)
+                )
             else:
                 completion_ids = [None] * len(all_prompts_text)
             # Broadcast the completions from the main process to all processes, ensuring each process receives its
@@ -702,30 +722,6 @@ class GRPOTrainer(Trainer):
             is_eos.size(0), -1
         )
         completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
-
-        # Concatenate prompt_mask with completion_mask for logit computation
-        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  # (B*G, P+C)
-
-        logits_to_keep = completion_ids.size(
-            1
-        )  # we only need to compute the logits for the completion tokens
-
-        # with torch.inference_mode():
-        #     if self.ref_model is not None:
-        #         ref_per_token_logps = self._get_per_token_logps(
-        #             self.ref_model,
-        #             prompt_completion_ids,
-        #             attention_mask,
-        #             logits_to_keep,
-        #         )
-        #     else:
-        #         with self.accelerator.unwrap_model(self.model).disable_adapter():
-        #             ref_per_token_logps = self._get_per_token_logps(
-        #                 self.model,
-        #                 prompt_completion_ids,
-        #                 attention_mask,
-        #                 logits_to_keep,
-        #             )
 
         # Decode the generated completions
         completions_text = self.processing_class.batch_decode(
@@ -783,8 +779,12 @@ class GRPOTrainer(Trainer):
                 output_reward_func = reward_func(
                     prompts=prompts, completions=completions, **reward_kwargs
                 )
+                reward_start_time = time.time()
                 rewards_per_func[:, i] = torch.tensor(
                     output_reward_func, dtype=torch.float32, device=device
+                )
+                self._metrics["reward_time"].append(
+                    round(time.time() - reward_start_time, 2)
                 )
 
         # Gather the reward per function: this part is crucial, because the rewards are normalized per group and the
@@ -851,23 +851,12 @@ class GRPOTrainer(Trainer):
             if wandb.run is not None and self.accelerator.is_main_process:
                 wandb.log({"completions": wandb.Table(dataframe=df)})
 
-        import pandas as pd
-
         return {
             "prompt_ids": prompt_ids,
             "prompt_mask": prompt_mask,
             "completion_ids": completion_ids,
             "completion_mask": completion_mask,
-            # "ref_per_token_logps": ref_per_token_logps,
             "advantages": advantages,
-            "df": pd.DataFrame(
-                {
-                    "step": [str(self.state.global_step)] * len(rewards),
-                    "prompt": gather_object(prompts_text),
-                    "completion": gather_object(completions_text),
-                    "reward": rewards.tolist(),
-                }
-            ),
         }
 
     def compute_loss(
@@ -884,37 +873,44 @@ class GRPOTrainer(Trainer):
         )
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
-        logits_to_keep = completion_ids.size(
+        completion_size = completion_ids.size(
             1
         )  # we only need to compute the logits for the completion tokens
 
-        df = inputs["df"]
-        df.prompt = df.prompt.apply(lambda x: x.split("<｜User｜>")[1])
-        import pdb
+        model_kwargs = {"output_hidden_states": True, "return_dict": False}
+        hidden_states = model(input_ids, attention_mask, **model_kwargs)[0]
+        with torch.inference_mode():
+            if self.ref_model is not None:
+                ref_hidden_states = self.ref_model(
+                    input_ids, attention_mask, **model_kwargs
+                )[0]
+            else:
+                with self.accelerator.unwrap_model(self.model).disable_adapter():
+                    ref_hidden_states = self.model(
+                        input_ids, attention_mask, **model_kwargs
+                    )[0]
+        weight = self.accelerator.unwrap_model(self.model).lm_head.weight
+        if self.ref_model is not None:
+            ref_weight = self.ref_model.lm_head.weight
+        else:
+            ref_weight = weight.clone().detach()
 
-        pdb.set_trace()
+        hidden_states = hidden_states[:, :-1, :]
+        ref_hidden_states = ref_hidden_states[:, :-1, :]
+        hidden_states = hidden_states[:, -completion_size:]
+        ref_hidden_states = ref_hidden_states[:, -completion_size:]
+        attention_mask = attention_mask[:, -completion_size:]
+        input_ids = input_ids[:, -completion_size:]
 
-        per_token_logps = self._get_per_token_logps(
-            model, input_ids, attention_mask, logits_to_keep
+        loss, metrics = self.loss_fn(
+            weight=weight,
+            inputs=hidden_states,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            advantages=inputs["advantages"],
+            ref_inputs=ref_hidden_states,
+            ref_weight=ref_weight,
         )
-
-        # Compute the KL divergence between the model and the reference model
-        ref_per_token_logps = inputs["ref_per_token_logps"]
-        per_token_kl = (
-            torch.exp(ref_per_token_logps - per_token_logps)
-            - (ref_per_token_logps - per_token_logps)
-            - 1
-        )
-
-        # x - x.detach() allows for preserving gradients from x
-        advantages = inputs["advantages"]
-        per_token_loss = torch.exp(
-            per_token_logps - per_token_logps.detach()
-        ) * advantages.unsqueeze(1)
-        per_token_loss = -(per_token_loss - self.beta * per_token_kl)
-        loss = (
-            (per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)
-        ).mean()
 
         # Log the metrics
         completion_length = (
@@ -925,9 +921,7 @@ class GRPOTrainer(Trainer):
         )
         self._metrics["completion_length"].append(completion_length)
 
-        mean_kl = (
-            (per_token_kl * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)
-        ).mean()
+        mean_kl = metrics[3]
         self._metrics["kl"].append(
             self.accelerator.gather_for_metrics(mean_kl).mean().item()
         )
