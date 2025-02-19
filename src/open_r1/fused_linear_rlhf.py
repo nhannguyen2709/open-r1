@@ -29,7 +29,7 @@ class LigerFusedLinearRLHFBase(torch.autograd.Function):
         # Initialize accumulators
         loss_acc = torch.zeros((), device=inputs.device)
         grad_weight = torch.zeros_like(weight)  # [V, H]
-        grad_inputs = []
+        grad_inputs = torch.zeros_like(inputs)  # [B, H]
         grad_bias = torch.zeros_like(bias) if bias is not None else None  # [V]
         aggregated_metrics = []
 
@@ -79,7 +79,8 @@ class LigerFusedLinearRLHFBase(torch.autograd.Function):
             input_ids_chunk,
             attention_mask_chunk,
             advantages_chunk,
-            ref_inputs_chunk=None,
+            ref_inputs_chunk,
+            chunk_idx,
         ):
             (chunk_grads, (chunk_loss, chunk_metrics)) = fused_fwd_bwd(
                 inputs_chunk,
@@ -93,7 +94,11 @@ class LigerFusedLinearRLHFBase(torch.autograd.Function):
 
             # Accumulate gradients and loss
             grad_weight.add_(chunk_grad_weight)
-            grad_inputs.append(chunk_grad_input)
+            grad_inputs[
+                chunk_idx
+                * inputs_chunk.size(0) : (chunk_idx + 1)
+                * inputs_chunk.size(0)
+            ].copy_(chunk_grad_input)
             loss_acc.add_(chunk_loss)
             if bias is not None:
                 chunk_grad_bias = chunk_grads[2]
@@ -125,30 +130,28 @@ class LigerFusedLinearRLHFBase(torch.autograd.Function):
         advantages_chunks = torch.chunk(advantages, chunks=chunks, dim=0)
         ref_input_chunks = torch.chunk(ref_inputs, chunks=chunks, dim=0)
 
-        for (
+        for chunk_idx, (
             input_chunk,
             input_ids_chunk,
             attention_mask_chunk,
             advantages_chunk,
             ref_input_chunk,
-        ) in zip(
-            input_chunks,
-            input_ids_chunks,
-            attention_mask_chunks,
-            advantages_chunks,
-            ref_input_chunks,
+        ) in enumerate(
+            zip(
+                input_chunks,
+                input_ids_chunks,
+                attention_mask_chunks,
+                advantages_chunks,
+                ref_input_chunks,
+            )
         ):
-            torch._dynamo.mark_dynamic(input_chunk, 1)
-            torch._dynamo.mark_dynamic(input_ids_chunk, 1)
-            torch._dynamo.mark_dynamic(attention_mask_chunk, 1)
-            torch._dynamo.mark_dynamic(advantages_chunk, 1)
-            torch._dynamo.mark_dynamic(ref_input_chunk, 1)
             accumulate_chunk(
                 input_chunk,
                 input_ids_chunk,
                 attention_mask_chunk,
                 advantages_chunk,
                 ref_input_chunk,
+                chunk_idx,
             )
 
         # Scale accumulated loss by number of chunks since we're averaging
@@ -156,7 +159,7 @@ class LigerFusedLinearRLHFBase(torch.autograd.Function):
 
         # Save for backward
         ctx.save_for_backward(
-            torch.cat(grad_inputs, dim=0) / chunks,
+            grad_inputs / chunks,
             grad_weight / chunks,
             grad_bias / chunks if bias is not None else None,
         )

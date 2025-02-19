@@ -33,6 +33,7 @@ from open_r1.rewards import (
 )
 from open_r1.utils.callbacks import get_callbacks
 from open_r1.grpo_trainer import GRPOTrainer
+from open_r1.utils.model_utils import get_tokenizer
 from open_r1.utils.wandb_logging import init_wandb_training
 
 
@@ -98,14 +99,6 @@ class GRPOScriptArguments(ScriptArguments):
     )
 
 
-SYSTEM_PROMPT = (
-    "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant "
-    "first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning "
-    "process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., "
-    "<think> reasoning process here </think><answer> answer here </answer>"
-)
-
-
 def main(script_args, training_args, model_args):
     # Set seed for reproducibility
     set_seed(training_args.seed)
@@ -144,6 +137,32 @@ def main(script_args, training_args, model_args):
     if training_args.eval_strategy != "no":
         eval_dataset = load_dataset("Maxwell-Jia/AIME_2024", split="train")
 
+    # Format into conversation
+    def make_conversation(example):
+        prompt = []
+
+        if training_args.system_prompt is not None:
+            prompt.append({"role": "system", "content": training_args.system_prompt})
+
+        prompt.append({"role": "user", "content": example["problem"]})
+        return {"prompt": prompt}
+
+    dataset = dataset.map(make_conversation)
+    for split in dataset:
+        if "messages" in dataset[split].column_names:
+            dataset[split] = dataset[split].remove_columns("messages")
+
+    train_dataset = dataset[script_args.dataset_train_split]
+    eval_dataset = eval_dataset.rename_columns(
+        {"Problem": "problem", "Solution": "solution", "Answer": "answer"}
+    )
+    eval_dataset = eval_dataset.map(make_conversation)
+
+    ################
+    # Load tokenizer
+    ################
+    tokenizer = get_tokenizer(model_args, training_args)
+
     # Get reward functions
     REWARD_FUNCS_REGISTRY = {
         "accuracy": accuracy_reward,
@@ -163,26 +182,6 @@ def main(script_args, training_args, model_args):
         "length": len_reward,
     }
     reward_funcs = [REWARD_FUNCS_REGISTRY[func] for func in script_args.reward_funcs]
-
-    # Format into conversation
-    def make_conversation(example):
-        return {
-            "prompt": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": example["problem"]},
-            ],
-        }
-
-    dataset = dataset.map(make_conversation)
-    for split in dataset:
-        if "messages" in dataset[split].column_names:
-            dataset[split] = dataset[split].remove_columns("messages")
-
-    train_dataset = dataset[script_args.dataset_train_split]
-    train_dataset = train_dataset.filter(
-        lambda x: any(x["correctness_math_verify"]) and x["question_type"] != "MCQ",
-        num_proc=16,
-    )
 
     logger.info("*** Initializing model kwargs ***")
     torch_dtype = (
@@ -210,6 +209,7 @@ def main(script_args, training_args, model_args):
         eval_dataset=eval_dataset,
         peft_config=get_peft_config(model_args),
         callbacks=get_callbacks(training_args, model_args),
+        processing_class=tokenizer,
     )
 
     ###############
@@ -223,7 +223,7 @@ def main(script_args, training_args, model_args):
         checkpoint = last_checkpoint
     train_result = trainer.train(resume_from_checkpoint=checkpoint)
     metrics = train_result.metrics
-    metrics["train_samples"] = len(dataset[script_args.dataset_train_split])
+    metrics["train_samples"] = len(train_dataset)
     trainer.log_metrics("train", metrics)
     trainer.save_metrics("train", metrics)
     trainer.save_state()
@@ -252,7 +252,7 @@ def main(script_args, training_args, model_args):
     if training_args.do_eval:
         logger.info("*** Evaluate ***")
         metrics = trainer.evaluate()
-        metrics["eval_samples"] = len(dataset[script_args.dataset_test_split])
+        metrics["eval_samples"] = len(eval_dataset)
         trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)
 

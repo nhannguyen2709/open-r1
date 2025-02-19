@@ -54,31 +54,14 @@ def accuracy_reward(completions, solution, **kwargs):
 
 
 def format_reward(completions, **kwargs):
-    """Reward function that checks if the completion has a specific format."""
-    # pattern = r"^<think>.*?</think>\s*<answer>.*?</answer>$"
-    completion_contents = [
-        "<think>" + completion[0]["content"] for completion in completions
+    """Reward function that checks if the reasoning process is enclosed within <think> and </think> tags, while the final answer is enclosed within <answer> and </answer> tags."""
+    pattern = r"^<think>.*?</think>\s*<answer>.*?</answer>$"
+    completion_contents = [completion[0]["content"] for completion in completions]
+    matches = [
+        re.match(pattern, content, re.DOTALL | re.MULTILINE)
+        for content in completion_contents
     ]
-    # matches = [
-    #     re.match(pattern, content, re.DOTALL | re.MULTILINE)
-    #     for content in completion_contents
-    # ]
-    # return [1.0 if match else 0.0 for match in matches]
-    rewards = []
-    for content in completion_contents:
-        if (
-            "<think>" in content
-            and "</think>" in content
-            and "<answer>" in content
-            and "</answer>" in content
-        ):
-            if content.startswith("<think>") and content.endswith("</answer>"):
-                rewards.append(1.0)
-            else:
-                rewards.append(0.0)
-        else:
-            rewards.append(0.0)
-    return rewards
+    return [1.0 if match else 0.0 for match in matches]
 
 
 def reasoning_steps_reward(completions, **kwargs):

@@ -566,9 +566,7 @@ class GRPOTrainer(Trainer):
         # identical prompts are distributed to different GPUs, allowing rewards to be computed and normalized correctly
         # within each prompt group. Using the same seed across processes ensures consistent prompt assignment,
         # preventing discrepancies in group formation.
-        return RepeatRandomSampler(
-            eval_dataset, self.num_generations, seed=self.args.seed
-        )
+        return RepeatRandomSampler(eval_dataset, 1, seed=self.args.seed)
 
     # Get the per-token log probabilities for the completions for the model and the reference model
     def _get_per_token_logps(self, model, input_ids, attention_mask, logits_to_keep):
@@ -782,12 +780,8 @@ class GRPOTrainer(Trainer):
                 output_reward_func = reward_func(
                     prompts=prompts, completions=completions, **reward_kwargs
                 )
-                reward_start_time = time.time()
                 rewards_per_func[:, i] = torch.tensor(
                     output_reward_func, dtype=torch.float32, device=device
-                )
-                self._metrics["reward_time"].append(
-                    round(time.time() - reward_start_time, 2)
                 )
 
         # Gather the reward per function: this part is crucial, because the rewards are normalized per group and the
@@ -867,8 +861,18 @@ class GRPOTrainer(Trainer):
     ):
         if return_outputs:
             raise ValueError("The GRPOTrainer does not support returning outputs")
-        # Compute the per-token log probabilities for the model
 
+        if not model.training:
+            completion_length = (
+                self.accelerator.gather_for_metrics(inputs["completion_mask"].sum(1))
+                .float()
+                .mean()
+                .item()
+            )
+            self._metrics["completion_length"].append(completion_length)
+            return torch.tensor([0.0], device=inputs["advantages"].device)
+
+        # Compute the per-token log probabilities for the model
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
         completion_ids, completion_mask = (
             inputs["completion_ids"],
@@ -904,6 +908,8 @@ class GRPOTrainer(Trainer):
         ref_hidden_states = ref_hidden_states[:, -completion_size:]
         attention_mask = attention_mask[:, -completion_size:]
         input_ids = input_ids[:, -completion_size:]
+        hidden_states = hidden_states.to(weight.dtype)
+        ref_hidden_states = ref_hidden_states.to(ref_weight.dtype)
 
         loss, metrics = self.loss_fn(
             weight=weight,
