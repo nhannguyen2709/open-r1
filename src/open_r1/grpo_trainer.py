@@ -287,6 +287,10 @@ class GRPOTrainer(Trainer):
         if peft_config is not None:
             model = get_peft_model(model, peft_config)
 
+        # Enable gradient checkpointing if requested
+        if args.gradient_checkpointing:
+            model = self._enable_gradient_checkpointing(model, args)
+
         # Reference model
         if is_deepspeed_zero3_enabled():
             self.ref_model = AutoModelForCausalLM.from_pretrained(
@@ -485,9 +489,9 @@ class GRPOTrainer(Trainer):
                         # Automatic Prefix Caching caches the KV cache of existing queries, so that a new query can
                         # directly reuse the KV cache if it shares the same prefix with one of the existing queries.
                         # This is particularly useful here because we generate completions from the same prompts.
-                        enable_prefix_caching=True,
+                        enable_prefix_caching=self.args.vllm_enable_prefix_caching,
+                        enforce_eager=self.args.vllm_enforce_eager,
                         max_model_len=self.args.vllm_max_model_len,
-                        enforce_eager=False,
                     )
                 self.sampling_params = SamplingParams(
                     temperature=args.temperature,
@@ -567,6 +571,31 @@ class GRPOTrainer(Trainer):
         # within each prompt group. Using the same seed across processes ensures consistent prompt assignment,
         # preventing discrepancies in group formation.
         return RepeatRandomSampler(eval_dataset, 1, seed=self.args.seed)
+
+    def _enable_gradient_checkpointing(
+        self, model: PreTrainedModel, args: GRPOConfig
+    ) -> PreTrainedModel:
+        """Enables gradient checkpointing for the model."""
+        # Ensure use_cache is disabled
+        model.config.use_cache = False
+
+        # Enable gradient checkpointing on the base model for PEFT
+        if is_peft_model(model):
+            model.base_model.gradient_checkpointing_enable()
+        # Enable gradient checkpointing for non-PEFT models
+        else:
+            model.gradient_checkpointing_enable()
+
+        gradient_checkpointing_kwargs = args.gradient_checkpointing_kwargs or {}
+        use_reentrant = (
+            "use_reentrant" not in gradient_checkpointing_kwargs
+            or gradient_checkpointing_kwargs["use_reentrant"]
+        )
+
+        if use_reentrant:
+            model.enable_input_require_grads()
+
+        return model
 
     # Get the per-token log probabilities for the completions for the model and the reference model
     def _get_per_token_logps(self, model, input_ids, attention_mask, logits_to_keep):
