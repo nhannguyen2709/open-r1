@@ -20,9 +20,9 @@ import torch
 from datasets import load_dataset
 from transformers import set_seed
 from transformers.trainer_utils import get_last_checkpoint
-from trl import ModelConfig, ScriptArguments, TrlParser, get_peft_config
+from trl import ScriptArguments, TrlParser, get_peft_config
 
-from open_r1.configs import GRPOConfig
+from open_r1.configs import GRPOConfig, ModelConfig
 from open_r1.rewards import (
     accuracy_reward,
     format_reward,
@@ -33,7 +33,7 @@ from open_r1.rewards import (
 )
 from open_r1.utils.callbacks import get_callbacks
 from open_r1.grpo_trainer import GRPOTrainer
-from open_r1.utils.model_utils import get_tokenizer
+from open_r1.utils.model_utils import get_quantization_config, get_tokenizer
 from open_r1.utils.wandb_logging import init_wandb_training
 
 
@@ -147,7 +147,11 @@ def main(script_args, training_args, model_args):
         prompt.append({"role": "user", "content": example["problem"]})
         return {"prompt": prompt}
 
-    dataset = dataset.map(make_conversation)
+    dataset = dataset.map(make_conversation, num_proc=4)
+    dataset[script_args.dataset_train_split] = dataset[
+        script_args.dataset_train_split
+    ].select(range(100))
+
     for split in dataset:
         if "messages" in dataset[split].column_names:
             dataset[split] = dataset[split].remove_columns("messages")
@@ -189,12 +193,14 @@ def main(script_args, training_args, model_args):
         if model_args.torch_dtype in ["auto", None]
         else getattr(torch, model_args.torch_dtype)
     )
+    quantization_config = get_quantization_config(model_args)
     model_kwargs = dict(
         revision=model_args.model_revision,
         trust_remote_code=model_args.trust_remote_code,
         attn_implementation=model_args.attn_implementation,
         torch_dtype=torch_dtype,
         use_cache=False if training_args.gradient_checkpointing else True,
+        quantization_config=quantization_config,
     )
     training_args.model_init_kwargs = model_kwargs
 

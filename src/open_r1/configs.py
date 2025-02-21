@@ -50,6 +50,15 @@ class GRPOConfig(trl.GRPOConfig):
     push_to_hub_revision: bool = field(
         default=False, metadata={"help": "Whether to push to a Hub revision/branch."}
     )
+    vllm_enable_prefix_caching: bool = field(
+        default=False, metadata={"help": "Whether to enable prefix caching."}
+    )
+    vllm_enforce_eager: bool = field(
+        default=False, metadata={"help": "Whether to enforce eager execution."}
+    )
+    vllm_max_model_len: int = field(
+        default=8192, metadata={"help": "The maximum model length."}
+    )
     wandb_entity: Optional[str] = field(
         default=None,
         metadata={"help": ("The entity to store runs under.")},
@@ -98,4 +107,16 @@ class SFTConfig(trl.SFTConfig):
     wandb_project: Optional[str] = field(
         default=None,
         metadata={"help": ("The project to store runs under.")},
+    )
+
+
+@dataclass
+class ModelConfig(trl.ModelConfig):
+    """
+    Configuration class for the models.
+    """
+
+    bnb_4bit_quant_storage: Optional[str] = field(
+        default="uint8",
+        metadata={"help": "Storage type to pack the quanitzed 4-bit params."},
     )
