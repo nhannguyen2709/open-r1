@@ -37,7 +37,6 @@ class GRPOConfig(trl.GRPOConfig):
     chat_template: Optional[str] = field(
         default=None, metadata={"help": "The chat template to use."}
     )
-    chat_template: Optional[str] = field(default=None, metadata={"help": "The chat template to use."})
     system_prompt: Optional[str] = field(
         default=None,
         metadata={"help": "The optional system prompt to use."},
