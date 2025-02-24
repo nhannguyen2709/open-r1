@@ -33,35 +33,94 @@ solution_parser = partial(
 )
 
 
-def accuracy_reward(completions, solution, **kwargs):
+# def accuracy_reward(completions, solution, **kwargs):
+#     """Reward function that checks if the completion is the same as the ground truth."""
+#     contents = [completion[0]["content"] for completion in completions]
+#     rewards = []
+#     for content, sol in zip(contents, solution):
+#         gold_parsed = solution_parser(sol)
+#         if len(gold_parsed) != 0:
+#             # We require the answer to be provided in correct latex (no malformed operators)
+#             answer_parsed = answer_parser(content)
+#             # Reward 1 if the content is the same as the ground truth, 0 otherwise
+#             reward = float(verify(answer_parsed, gold_parsed))
+#         else:
+#             # If the gold solution is not parseable, we reward 1 to skip this example
+#             reward = 1.0
+#             # print("Failed to parse gold solution: ", sol)
+#         rewards.append(reward)
+
+#     return rewards
+
+def extract_boxed_text(text):
+    pattern = r'oxed{(.*?)}'
+    matches = re.findall(pattern, text)
+    if not matches:
+        return ""
+    for match in matches[::-1]:
+        if match != "":
+            return match
+    return ""
+
+
+def accuracy_reward(completions, answer, **kwargs):
     """Reward function that checks if the completion is the same as the ground truth."""
     contents = [completion[0]["content"] for completion in completions]
     rewards = []
-    for content, sol in zip(contents, solution):
-        gold_parsed = solution_parser(sol)
-        if len(gold_parsed) != 0:
-            # We require the answer to be provided in correct latex (no malformed operators)
-            answer_parsed = answer_parser(content)
-            # Reward 1 if the content is the same as the ground truth, 0 otherwise
-            reward = float(verify(answer_parsed, gold_parsed))
-        else:
-            # If the gold solution is not parseable, we reward 1 to skip this example
-            reward = 1.0
-            # print("Failed to parse gold solution: ", sol)
+    for content, ans in zip(contents, answer):
+        # print(f"content: {content}")
+        # print(f"ans: {ans}")
+        # We require the answer to be provided in correct latex (no malformed operators)
+        answer_parsed = extract_boxed_text(content)
+        
+        # Reward 1 if the answer_parsed is the same as the ground truth, 0 otherwise
+        # print(f"answer_parsed: {answer_parsed}")
+        try:
+            parsed_value = float(answer_parsed) if answer_parsed else -1e9
+            reward = float(int(parsed_value) == int(ans))
+        except ValueError:
+            reward = 0.0
+        # print(f"reward: {reward}")
         rewards.append(reward)
 
     return rewards
 
 
+# def format_reward(completions, **kwargs):
+#     """Reward function that checks if the reasoning process is enclosed within <think> and </think> tags, while the final answer is enclosed within <answer> and </answer> tags."""
+#     pattern = r"^<think>.*?</think>\s*<answer>.*?</answer>$"
+#     completion_contents = [completion[0]["content"] for completion in completions]
+#     matches = [
+#         re.match(pattern, content, re.DOTALL | re.MULTILINE)
+#         for content in completion_contents
+#     ]
+#     print(f"completion_contents: {completion_contents}")
+#     print(f"matches: {matches}")
+#     return [1.0 if match else 0.0 for match in matches]
+
 def format_reward(completions, **kwargs):
-    """Reward function that checks if the reasoning process is enclosed within <think> and </think> tags, while the final answer is enclosed within <answer> and </answer> tags."""
-    pattern = r"^<think>.*?</think>\s*<answer>.*?</answer>$"
+    """Reward function that gives:
+    - 0.25 points if </think> tag is present
+    - 0.25 points if \boxed{ is present
+    - Additional 0.5 points if both are present
+    """
     completion_contents = [completion[0]["content"] for completion in completions]
-    matches = [
-        re.match(pattern, content, re.DOTALL | re.MULTILINE)
-        for content in completion_contents
-    ]
-    return [1.0 if match else 0.0 for match in matches]
+    rewards = []
+    
+    for content in completion_contents:
+        reward = 0.0
+        if "</think>" in content:
+            reward += 0.25
+        if "\\boxed{" in content:
+            reward += 0.25
+        if "</think>" in content and "\\boxed{" in content:
+            reward += 0.5
+        rewards.append(reward)
+    
+    # print(f"completion_contents: {completion_contents[0]}")
+    # print(rewards[0])
+    
+    return rewards
 
 
 def reasoning_steps_reward(completions, **kwargs):

@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 
 import torch
 from datasets import load_dataset
+import datasets
 from transformers import set_seed
 from transformers.trainer_utils import get_last_checkpoint
 from trl import ScriptArguments, TrlParser, get_peft_config
@@ -36,6 +37,7 @@ from open_r1.grpo_trainer import GRPOTrainer
 from open_r1.utils.model_utils import get_quantization_config, get_tokenizer
 from open_r1.utils.wandb_logging import init_wandb_training
 
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 
@@ -132,7 +134,7 @@ def main(script_args, training_args, model_args):
         init_wandb_training(training_args)
 
     # Load the dataset
-    dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
+    # dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
     eval_dataset = None
     if training_args.eval_strategy != "no":
         eval_dataset = load_dataset("Maxwell-Jia/AIME_2024", split="train")
@@ -144,24 +146,29 @@ def main(script_args, training_args, model_args):
         if training_args.system_prompt is not None:
             prompt.append({"role": "system", "content": training_args.system_prompt})
 
-        prompt.append({"role": "user", "content": example["problem"]})
+        prompt.append({"role": "user", "content": example["problem"] + "\nPlease put the final answer within \\boxed{}."})
         return {"prompt": prompt}
 
-    dataset = dataset.map(make_conversation, num_proc=4)
-    dataset[script_args.dataset_train_split] = dataset[
-        script_args.dataset_train_split
-    ].select(range(100))
+    # dataset = dataset.map(make_conversation, num_proc=4)
+    # dataset[script_args.dataset_train_split] = dataset[
+    #     script_args.dataset_train_split
+    # ].select(range(100))
 
-    for split in dataset:
-        if "messages" in dataset[split].column_names:
-            dataset[split] = dataset[split].remove_columns("messages")
+    # for split in dataset:
+    #     if "messages" in dataset[split].column_names:
+    #         dataset[split] = dataset[split].remove_columns("messages")
 
-    train_dataset = dataset[script_args.dataset_train_split]
+    # train_dataset = dataset[script_args.dataset_train_split]
+    train_dataset = pd.read_parquet("openr1_int_sample_easy.parquet")
+    train_dataset = datasets.Dataset.from_pandas(train_dataset)
+
+    train_dataset = train_dataset.map(make_conversation)
     eval_dataset = eval_dataset.rename_columns(
         {"Problem": "problem", "Solution": "solution", "Answer": "answer"}
     )
     eval_dataset = eval_dataset.map(make_conversation)
-
+    # overfit check
+    # train_dataset = eval_dataset
     ################
     # Load tokenizer
     ################
@@ -171,19 +178,19 @@ def main(script_args, training_args, model_args):
     REWARD_FUNCS_REGISTRY = {
         "accuracy": accuracy_reward,
         "format": format_reward,
-        "reasoning_steps": reasoning_steps_reward,
-        "cosine": get_cosine_scaled_reward(
-            min_value_wrong=script_args.cosine_min_value_wrong,
-            max_value_wrong=script_args.cosine_max_value_wrong,
-            min_value_correct=script_args.cosine_min_value_correct,
-            max_value_correct=script_args.cosine_max_value_correct,
-            max_len=script_args.cosine_max_len,
-        ),
-        "repetition_penalty": get_repetition_penalty_reward(
-            ngram_size=script_args.repetition_n_grams,
-            max_penalty=script_args.repetition_max_penalty,
-        ),
-        "length": len_reward,
+        # "reasoning_steps": reasoning_steps_reward,
+        # "cosine": get_cosine_scaled_reward(
+        #     min_value_wrong=script_args.cosine_min_value_wrong,
+        #     max_value_wrong=script_args.cosine_max_value_wrong,
+        #     min_value_correct=script_args.cosine_min_value_correct,
+        #     max_value_correct=script_args.cosine_max_value_correct,
+        #     max_len=script_args.cosine_max_len,
+        # ),
+        # "repetition_penalty": get_repetition_penalty_reward(
+        #     ngram_size=script_args.repetition_n_grams,
+        #     max_penalty=script_args.repetition_max_penalty,
+        # ),
+        # "length": len_reward,
     }
     reward_funcs = [REWARD_FUNCS_REGISTRY[func] for func in script_args.reward_funcs]
 
@@ -265,9 +272,9 @@ def main(script_args, training_args, model_args):
     #############
     # push to hub
     #############
-    if training_args.push_to_hub:
-        logger.info("Pushing to hub...")
-        trainer.push_to_hub(**kwargs)
+    # if training_args.push_to_hub:
+    #     logger.info("Pushing to hub...")
+    #     trainer.push_to_hub(**kwargs)
 
 
 if __name__ == "__main__":

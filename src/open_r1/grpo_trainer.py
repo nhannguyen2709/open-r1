@@ -891,15 +891,15 @@ class GRPOTrainer(Trainer):
         if return_outputs:
             raise ValueError("The GRPOTrainer does not support returning outputs")
 
-        if not model.training:
-            completion_length = (
-                self.accelerator.gather_for_metrics(inputs["completion_mask"].sum(1))
-                .float()
-                .mean()
-                .item()
-            )
-            self._metrics["completion_length"].append(completion_length)
-            return torch.tensor([0.0], device=inputs["advantages"].device)
+        # if not model.training:
+        #     completion_length = (
+        #         self.accelerator.gather_for_metrics(inputs["completion_mask"].sum(1))
+        #         .float()
+        #         .mean()
+        #         .item()
+        #     )
+        #     self._metrics["completion_length"].append(completion_length)
+        #     return torch.tensor([0.0], device=inputs["advantages"].device)
 
         # Compute the per-token log probabilities for the model
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
@@ -989,8 +989,8 @@ class GRPOTrainer(Trainer):
         # start with "eval_". We need to add the prefix "eval_" to the keys in `metrics` to match the format.
         if next(iter(logs.keys())).startswith("eval_"):
             metrics = {f"eval_{key}": val for key, val in metrics.items()}
-
         logs = {**logs, **metrics}
+        # print(logs)
         if version.parse(transformers.__version__) >= version.parse("4.47.0.dev0"):
             super().log(logs, start_time)
         else:  # transformers<=4.46

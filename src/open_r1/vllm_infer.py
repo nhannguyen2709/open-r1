@@ -10,6 +10,7 @@ import keyword
 from collections import Counter
 import random
 from vllm import LLM, SamplingParams
+from vllm.lora.request import LoRARequest
 from datasets import load_dataset
 
 
@@ -24,8 +25,9 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "4,5,6,7"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 llm_model_pth = "agentica-org/DeepScaleR-1.5B-Preview"
+# llm_model_pth = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
 
-MAX_NUM_SEQS = 4
+MAX_NUM_SEQS = 16
 MAX_MODEL_LEN = 8192
 
 llm = LLM(
@@ -37,6 +39,8 @@ llm = LLM(
     tensor_parallel_size=4,       # The number of GPUs to use for distributed execution with tensor parallelism
     gpu_memory_utilization=0.95,  # The ratio (between 0 and 1) of GPU memory to reserve for the model
     seed=2024,
+    enable_lora=True,
+    max_lora_rank=256,
 )
 
 tokenizer = llm.get_tokenizer()
@@ -91,6 +95,7 @@ def batch_message_generate(list_of_messages) -> list[list[dict]]:
     request_output = llm.generate(
         prompts=list_of_texts,
         sampling_params=sampling_params,
+        lora_request=LoRARequest("my_adapter", 1, "data/DeepScaleR-1.5B-Simple-RL/checkpoint-60")
     )
 
     print([len(single_request_output.outputs[0].token_ids) for single_request_output in request_output])
@@ -131,30 +136,36 @@ def batch_message_filter(list_of_messages) -> tuple[list[list[dict]], list[str]]
     return list_of_messages_to_keep, extracted_answers
 
 
+# def create_starter_messages(question, index):
+#     options = []
+#     for _ in range(2):
+#         options.append(
+#             [
+#                 {"role": "system", "content": "You are a the most powerful math expert. Please solve the problems with deep resoning. You are careful and always recheck your conduction. You will never give answer directly until you have enough confidence. You should think step-by-step. Return final answer within \\boxed{}, after taking modulo 1000."},
+#                 {"role": "user", "content": question},
+#             ]
+#         )
+#     for _ in range(1):
+#         options.append(
+#             [
+#                 {"role": "system", "content": "You are a helpful and harmless math assistant. You should think step-by-step and you are good at reverse thinking to recheck your answer and fix all possible mistakes. After you get your final answer, take modulo 1000, and return the final answer within \\boxed{}."},
+#                 {"role": "user", "content": question},
+#             ],
+#         )
+#     for _ in range(1):
+#         options.append(
+#             [
+#                 {"role": "system", "content": "Please carefully read the problem statement first to ensure you fully understand its meaning and key points. Then, solve the problem correctly and completely through deep reasoning. Finally, return the result modulo 1000 and enclose it in \\boxed{} like \"Atfer take the result modulo 1000, final anwer is \\boxed{180}."},
+#                 {"role": "user", "content": question},
+#             ],
+#         )
+#     return options[index % len(options)]
+
 def create_starter_messages(question, index):
-    options = []
-    for _ in range(2):
-        options.append(
-            [
-                {"role": "system", "content": "You are a the most powerful math expert. Please solve the problems with deep resoning. You are careful and always recheck your conduction. You will never give answer directly until you have enough confidence. You should think step-by-step. Return final answer within \\boxed{}, after taking modulo 1000."},
-                {"role": "user", "content": question},
-            ]
-        )
-    for _ in range(1):
-        options.append(
-            [
-                {"role": "system", "content": "You are a helpful and harmless math assistant. You should think step-by-step and you are good at reverse thinking to recheck your answer and fix all possible mistakes. After you get your final answer, take modulo 1000, and return the final answer within \\boxed{}."},
-                {"role": "user", "content": question},
-            ],
-        )
-    for _ in range(1):
-        options.append(
-            [
-                {"role": "system", "content": "Please carefully read the problem statement first to ensure you fully understand its meaning and key points. Then, solve the problem correctly and completely through deep reasoning. Finally, return the result modulo 1000 and enclose it in \\boxed{} like \"Atfer take the result modulo 1000, final anwer is \\boxed{180}."},
-                {"role": "user", "content": question},
-            ],
-        )
-    return options[index % len(options)]
+    messages = [
+        {"role": "user", "content": question + "\nPlease put the final answer within \\boxed{}."},
+    ]
+    return messages
 
 
 def predict_for_question(question: str) -> int:
