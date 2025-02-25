@@ -47,8 +47,21 @@ class GRPOConfig(trl.GRPOConfig):
     overwrite_hub_revision: bool = field(
         default=False, metadata={"help": "Whether to overwrite the Hub revision."}
     )
+    num_iterations: int = field(
+        default=1,
+        metadata={
+            "help": "Number of iterations per batch (denoted as μ in the algorithm)."
+        },
+    )
+    epsilon: float = field(
+        default=0.2,
+        metadata={"help": "Epsilon value for clipping."},
+    )
     push_to_hub_revision: bool = field(
         default=False, metadata={"help": "Whether to push to a Hub revision/branch."}
+    )
+    vllm_worker_num: int = field(
+        default=1, metadata={"help": "The number of vLLM workers to use."}
     )
     vllm_enable_prefix_caching: bool = field(
         default=False, metadata={"help": "Whether to enable prefix caching."}
@@ -86,7 +99,9 @@ class SFTConfig(trl.SFTConfig):
     chat_template: Optional[str] = field(
         default=None, metadata={"help": "The chat template to use."}
     )
-    chat_template: Optional[str] = field(default=None, metadata={"help": "The chat template to use."})
+    chat_template: Optional[str] = field(
+        default=None, metadata={"help": "The chat template to use."}
+    )
     system_prompt: Optional[str] = field(
         default=None,
         metadata={"help": "The optional system prompt to use."},
