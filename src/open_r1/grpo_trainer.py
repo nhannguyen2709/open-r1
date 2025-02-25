@@ -47,7 +47,8 @@ from trl.data_utils import (
     is_conversational,
     maybe_apply_chat_template,
 )
-from trl.extras.profiling import profiling_decorator
+
+# from trl.extras.profiling import profiling_decorator
 from trl.import_utils import is_vllm_available
 from trl.models import (
     create_reference_model,
@@ -712,7 +713,7 @@ class GRPOTrainer(Trainer):
         return model
 
     # Get the per-token log probabilities for the completions for the model and the reference model
-    @profiling_decorator
+    # @profiling_decorator
     def _get_per_token_logps(self, model, input_ids, attention_mask, logits_to_keep):
         # We add 1 to `logits_to_keep` because the last logits of the sequence is later excluded
         logits = model(
@@ -732,7 +733,7 @@ class GRPOTrainer(Trainer):
             logits, input_ids
         )  #  compute logprobs for the input tokens
 
-    @profiling_decorator
+    # @profiling_decorator
     def _move_model_to_vllm(self):
         with unwrap_model_for_generation(
             self.model,
@@ -789,7 +790,7 @@ class GRPOTrainer(Trainer):
             )
         return worker_outputs
 
-    @profiling_decorator
+    # @profiling_decorator
     def _prepare_inputs(
         self, inputs: dict[str, Union[torch.Tensor, Any]]
     ) -> dict[str, Union[torch.Tensor, Any]]:
@@ -1059,7 +1060,7 @@ class GRPOTrainer(Trainer):
             "advantages": advantages,
         }
 
-    @profiling_decorator
+    # @profiling_decorator
     def compute_loss(
         self, model, inputs, return_outputs=False, num_items_in_batch=None
     ):
