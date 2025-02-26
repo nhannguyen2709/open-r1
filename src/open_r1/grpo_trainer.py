@@ -1002,7 +1002,21 @@ class GRPOTrainer(Trainer):
             .mean()
             .item()
         )
+        min_completion_length = (
+            self.accelerator.gather_for_metrics(completion_mask.sum(1).min(0))
+            .float()
+            .mean()
+            .item()
+        )
+        max_completion_length = (
+            self.accelerator.gather_for_metrics(completion_mask.sum(1).max(0))
+            .float()
+            .mean()
+            .item()
+        )
         self._metrics[mode]["completion_length"].append(completion_length)
+        self._metrics[mode]["min_completion_length"].append(min_completion_length)
+        self._metrics[mode]["max_completion_length"].append(max_completion_length)
 
         reward_per_func = rewards_per_func.mean(0)
         for i, reward_func in enumerate(self.reward_funcs):
@@ -1123,21 +1137,24 @@ class GRPOTrainer(Trainer):
             ref_weight,
             inputs.get("old_per_token_logps", None),
         )
-        # Update the old per-token log probabilities for the next iteration
-        self._buffered_inputs[self._step % self.args.gradient_accumulation_steps][
-            "old_per_token_logps"
-        ] = metrics[5]
 
         mode = "eval" if self.control.should_evaluate else "train"
         mean_kl = metrics[3]
         self._metrics[mode]["kl"].append(
             self.accelerator.gather_for_metrics(mean_kl).mean().item()
         )
+
         clip_ratio = metrics[4]
         self._metrics[mode]["clip_ratio"].append(
             self.accelerator.gather_for_metrics(clip_ratio).mean().item()
         )
-        mode = "eval" if self.control.should_evaluate else "train"
+
+        # Update the old per-token log probabilities for the next iteration
+        old_per_token_logps = metrics[5]
+        self._buffered_inputs[self._step % self.args.gradient_accumulation_steps][
+            "old_per_token_logps"
+        ] = old_per_token_logps
+
         if mode == "train":
             self._step += 1  # increment every forward + backward
         return loss
