@@ -1137,7 +1137,9 @@ class GRPOTrainer(Trainer):
         self._metrics[mode]["clip_ratio"].append(
             self.accelerator.gather_for_metrics(clip_ratio).mean().item()
         )
-        self._step += 1
+        mode = "eval" if self.control.should_evaluate else "train"
+        if mode == "train":
+            self._step += 1  # increment every forward + backward
         return loss
 
     def prediction_step(
