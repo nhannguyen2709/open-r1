@@ -1149,13 +1149,12 @@ class GRPOTrainer(Trainer):
             self.accelerator.gather_for_metrics(clip_ratio).mean().item()
         )
 
-        # Update the old per-token log probabilities for the next iteration
-        old_per_token_logps = metrics[5]
-        self._buffered_inputs[self._step % self.args.gradient_accumulation_steps][
-            "old_per_token_logps"
-        ] = old_per_token_logps
-
         if mode == "train":
+            # Update the old per-token log probabilities for the next iteration
+            old_per_token_logps = metrics[5]
+            self._buffered_inputs[self._step % self.args.gradient_accumulation_steps][
+                "old_per_token_logps"
+            ] = old_per_token_logps
             self._step += 1  # increment every forward + backward
         return loss
 
