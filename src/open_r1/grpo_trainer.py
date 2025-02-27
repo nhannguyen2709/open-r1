@@ -48,7 +48,7 @@ from trl.data_utils import (
     maybe_apply_chat_template,
 )
 
-# from trl.extras.profiling import profiling_decorator
+from trl.extras.profiling import profiling_decorator
 from trl.import_utils import is_vllm_available
 from trl.models import (
     create_reference_model,
@@ -56,7 +56,6 @@ from trl.models import (
     unwrap_model_for_generation,
 )
 from trl.trainer.callbacks import SyncRefModelCallback
-from trl.trainer.grpo_config import GRPOConfig
 from trl.trainer.utils import (
     generate_model_card,
     get_comet_experiment_url,
@@ -75,6 +74,7 @@ if is_vllm_available():
 if is_wandb_available():
     import wandb
 
+from open_r1.configs import GRPOConfig
 from open_r1.grpo_loss import LigerFusedLinearGRPOLoss
 from open_r1.monkey_patch import forward_hidden_states
 
@@ -448,7 +448,9 @@ class GRPOTrainer(Trainer):
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
         self.log_completions = args.log_completions
 
-        self.liger_grpo_loss = LigerFusedLinearGRPOLoss(beta=args.beta, compiled=True)
+        self.liger_grpo_loss = LigerFusedLinearGRPOLoss(
+            beta=args.beta, epsilon=args.epsilon, compiled=True
+        )
 
         super().__init__(
             model=model,
@@ -555,6 +557,9 @@ class GRPOTrainer(Trainer):
                 with (
                     world_size_patch
                 ), get_rank_patch, new_group_patch, get_backend_patch, profiling_patch:
+                    print(
+                        f"Initializing vLLM on {vllm_device} from accelerator rank {rank}"
+                    )
                     self.llm = LLM(
                         model=model.name_or_path,
                         device=vllm_device,
@@ -713,7 +718,7 @@ class GRPOTrainer(Trainer):
         return model
 
     # Get the per-token log probabilities for the completions for the model and the reference model
-    # @profiling_decorator
+    @profiling_decorator
     def _get_per_token_logps(self, model, input_ids, attention_mask, logits_to_keep):
         # We add 1 to `logits_to_keep` because the last logits of the sequence is later excluded
         logits = model(
@@ -733,7 +738,7 @@ class GRPOTrainer(Trainer):
             logits, input_ids
         )  #  compute logprobs for the input tokens
 
-    # @profiling_decorator
+    @profiling_decorator
     def _move_model_to_vllm(self):
         with unwrap_model_for_generation(
             self.model,
@@ -789,27 +794,6 @@ class GRPOTrainer(Trainer):
                 use_tqdm=False,
             )
         return worker_outputs
-
-    # @profiling_decorator
-    def _prepare_inputs(
-        self, inputs: dict[str, Union[torch.Tensor, Any]]
-    ) -> dict[str, Union[torch.Tensor, Any]]:
-        mode = "eval" if self.control.should_evaluate else "train"
-        if mode == "train":
-            if self.state.global_step % self.num_iterations == 0:
-                inputs = self._generate_and_score_completions(inputs)
-                self._buffered_inputs[
-                    self._step % self.args.gradient_accumulation_steps
-                ] = inputs
-            else:
-                inputs = self._buffered_inputs[
-                    self._step % self.args.gradient_accumulation_steps
-                ]
-            self._step += 1
-        else:
-            # In evaluation, we don't reuse completions across multiple updates, so we don't need to buffer inputs.
-            inputs = self._generate_and_score_completions(inputs)
-        return inputs
 
     def _generate_and_score_completions(
         self, inputs: dict[str, Union[torch.Tensor, Any]]
@@ -899,6 +883,8 @@ class GRPOTrainer(Trainer):
             prompt_length = prompt_ids.size(1)
             prompt_ids = prompt_completion_ids[:, :prompt_length]
             completion_ids = prompt_completion_ids[:, prompt_length:]
+
+        self.accelerator.wait_for_everyone()
 
         # Mask everything after the first EOS token
         is_eos = completion_ids == self.processing_class.eos_token_id
@@ -1016,7 +1002,21 @@ class GRPOTrainer(Trainer):
             .mean()
             .item()
         )
+        min_completion_length = (
+            self.accelerator.gather_for_metrics(completion_mask.sum(1))
+            .float()
+            .min()
+            .item()
+        )
+        max_completion_length = (
+            self.accelerator.gather_for_metrics(completion_mask.sum(1))
+            .float()
+            .max()
+            .item()
+        )
         self._metrics[mode]["completion_length"].append(completion_length)
+        self._metrics[mode]["min_completion_length"].append(min_completion_length)
+        self._metrics[mode]["max_completion_length"].append(max_completion_length)
 
         reward_per_func = rewards_per_func.mean(0)
         for i, reward_func in enumerate(self.reward_funcs):
@@ -1060,7 +1060,27 @@ class GRPOTrainer(Trainer):
             "advantages": advantages,
         }
 
-    # @profiling_decorator
+    @profiling_decorator
+    def _prepare_inputs(
+        self, inputs: dict[str, Union[torch.Tensor, Any]]
+    ) -> dict[str, Union[torch.Tensor, Any]]:
+        mode = "eval" if self.control.should_evaluate else "train"
+        if mode == "train":
+            if self.state.global_step % self.num_iterations == 0:
+                inputs = self._generate_and_score_completions(inputs)
+                self._buffered_inputs[
+                    self._step % self.args.gradient_accumulation_steps
+                ] = inputs
+            else:
+                inputs = self._buffered_inputs[
+                    self._step % self.args.gradient_accumulation_steps
+                ]
+        else:
+            # In evaluation, we don't reuse completions across multiple updates, so we don't need to buffer inputs.
+            inputs = self._generate_and_score_completions(inputs)
+        return inputs
+
+    @profiling_decorator
     def compute_loss(
         self, model, inputs, return_outputs=False, num_items_in_batch=None
     ):
@@ -1096,7 +1116,7 @@ class GRPOTrainer(Trainer):
                         )[0]
         weight = self.accelerator.unwrap_model(self.model).lm_head.weight
         if self.ref_model is not None:
-            ref_weight = self.ref_model.lm_head.weight
+            ref_weight = self.accelerator.unwrap_model(self.ref_model).lm_head.weight
         else:
             ref_weight = weight.clone().detach()
 
@@ -1110,13 +1130,14 @@ class GRPOTrainer(Trainer):
         ref_hidden_states = ref_hidden_states.to(ref_weight.dtype)
 
         loss, metrics = self.liger_grpo_loss(
-            weight=weight,
-            inputs=hidden_states,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            advantages=inputs["advantages"],
-            ref_inputs=ref_hidden_states,
-            ref_weight=ref_weight,
+            hidden_states,
+            weight,
+            input_ids,
+            attention_mask,
+            inputs["advantages"],
+            ref_hidden_states,
+            ref_weight,
+            inputs.get("old_per_token_logps", None),
         )
 
         mode = "eval" if self.control.should_evaluate else "train"
@@ -1125,56 +1146,20 @@ class GRPOTrainer(Trainer):
             self.accelerator.gather_for_metrics(mean_kl).mean().item()
         )
 
+        clip_ratio = metrics[4]
+        self._metrics[mode]["clip_ratio"].append(
+            self.accelerator.gather_for_metrics(clip_ratio).mean().item()
+        )
+
+        # Update the old per-token log probabilities for the next iteration
+        old_per_token_logps = metrics[5]
+        self._buffered_inputs[self._step % self.args.gradient_accumulation_steps][
+            "old_per_token_logps"
+        ] = old_per_token_logps
+
+        if mode == "train":
+            self._step += 1  # increment every forward + backward
         return loss
-
-        # per_token_logps = self._get_per_token_logps(
-        #     model, input_ids, attention_mask, logits_to_keep
-        # )
-
-        # # Compute the KL divergence between the model and the reference model
-        # if self.beta != 0.0:
-        #     ref_per_token_logps = inputs["ref_per_token_logps"]
-        #     per_token_kl = (
-        #         torch.exp(ref_per_token_logps - per_token_logps)
-        #         - (ref_per_token_logps - per_token_logps)
-        #         - 1
-        #     )
-
-        # # Compute the loss
-        # advantages = inputs["advantages"]
-        # # When using num_iterations == 1, old_per_token_logps == per_token_logps, so we can skip it's computation (see
-        # # _generate_and_score_completions) and use per_token_logps.detach() instead.
-        # old_per_token_logps = (
-        #     inputs["old_per_token_logps"]
-        #     if self.num_iterations > 1
-        #     else per_token_logps.detach()
-        # )
-        # coef_1 = torch.exp(per_token_logps - old_per_token_logps)
-        # coef_2 = torch.clamp(coef_1, 1 - self.epsilon, 1 + self.epsilon)
-        # per_token_loss1 = coef_1 * advantages.unsqueeze(1)
-        # per_token_loss2 = coef_2 * advantages.unsqueeze(1)
-        # per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
-        # if self.beta != 0.0:
-        #     per_token_loss = per_token_loss + self.beta * per_token_kl
-        # loss = (per_token_loss * completion_mask).sum() / completion_mask.sum()
-
-        # # Log the metrics
-        # mode = "eval" if self.control.should_evaluate else "train"
-
-        # if self.beta != 0.0:
-        #     mean_kl = (
-        #         (per_token_kl * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)
-        #     ).mean()
-        #     self._metrics[mode]["kl"].append(
-        #         self.accelerator.gather_for_metrics(mean_kl).mean().item()
-        #     )
-
-        # is_clipped = (per_token_loss1 < per_token_loss2).float()
-        # clip_ratio = (is_clipped * completion_mask).sum() / completion_mask.sum()
-        # self._metrics[mode]["clip_ratio"].append(
-        #     self.accelerator.gather_for_metrics(clip_ratio).mean().item()
-        # )
-        # return loss
 
     def prediction_step(
         self,
