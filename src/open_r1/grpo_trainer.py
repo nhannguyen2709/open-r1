@@ -1191,6 +1191,39 @@ class GRPOTrainer(Trainer):
             super().log(logs)
         self._metrics[mode].clear()
 
+    def _save_checkpoint(self, model, trial):
+        super()._save_checkpoint(model, trial)
+        run_dir = self._get_output_dir(trial=trial)
+        output_dir = os.path.join(run_dir, f"checkpoint-{self.state.global_step}")
+        buffer_cpu = [
+            {k: v.cpu() for k, v in inputs.items()} for inputs in self._buffered_inputs
+        ]
+        rank = self.accelerator.process_index
+        torch.save(buffer_cpu, os.path.join(output_dir, f"buffered_inputs_{rank}.pt"))
+
+    def _inner_training_loop(
+        self,
+        batch_size=None,
+        args=None,
+        resume_from_checkpoint=None,
+        trial=None,
+        ignore_keys_for_eval=None,
+    ):
+        if resume_from_checkpoint is not None:
+            rank = self.accelerator.process_index
+            buffer_cpu = torch.load(
+                os.path.join(resume_from_checkpoint, f"buffered_inputs_{rank}.pt")
+            )
+            self._buffered_inputs = [
+                {k: v.to(self.accelerator.device) for k, v in inputs.items()}
+                for inputs in buffer_cpu
+            ]
+            global_step = int(resume_from_checkpoint.split("-")[-1])
+            self._step = global_step * self.args.gradient_accumulation_steps
+        return super()._inner_training_loop(
+            batch_size, args, resume_from_checkpoint, trial, ignore_keys_for_eval
+        )
+
     def create_model_card(
         self,
         model_name: Optional[str] = None,
