@@ -1080,17 +1080,20 @@ class GRPOTrainer(Trainer):
         )  # we only need to compute the logits for the completion tokens
 
         model_kwargs = {"output_hidden_states": True, "return_dict": False}
-        hidden_states = model(input_ids, attention_mask, **model_kwargs)[0]
+        with torch.cuda.device(model.device):
+            hidden_states = model(input_ids, attention_mask, **model_kwargs)[0]
         with torch.inference_mode():
             if self.ref_model is not None:
-                ref_hidden_states = self.ref_model(
-                    input_ids, attention_mask, **model_kwargs
-                )[0]
-            else:
-                with self.accelerator.unwrap_model(self.model).disable_adapter():
-                    ref_hidden_states = self.model(
+                with torch.cuda.device(self.ref_model.device):
+                    ref_hidden_states = self.ref_model(
                         input_ids, attention_mask, **model_kwargs
                     )[0]
+            else:
+                with self.accelerator.unwrap_model(self.model).disable_adapter():
+                    with torch.cuda.device(self.model.device):
+                        ref_hidden_states = self.model(
+                            input_ids, attention_mask, **model_kwargs
+                        )[0]
         weight = self.accelerator.unwrap_model(self.model).lm_head.weight
         if self.ref_model is not None:
             ref_weight = self.ref_model.lm_head.weight
