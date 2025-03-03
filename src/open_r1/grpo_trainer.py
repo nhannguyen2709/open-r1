@@ -969,7 +969,7 @@ class GRPOTrainer(Trainer):
                 )
             sft_completion_inputs["input_ids"] = pad(
                 sft_completion_inputs["input_ids"],
-                padding_value=self.processing_class.pad_token_id,
+                padding_value=-100,
             )
             sft_completion_inputs["attention_mask"] = pad(
                 sft_completion_inputs["attention_mask"], padding_value=0
@@ -1236,6 +1236,11 @@ class GRPOTrainer(Trainer):
             # Log SFT loss
             self._metrics[mode]["sft_loss"].append(
                 self.accelerator.gather_for_metrics(sft_loss).mean().item()
+            )
+            self._metrics[mode]["num_sft_tokens"].append(
+                self.accelerator.gather_for_metrics(sft_completion_mask.sum())
+                .sum()
+                .item()
             )
             total_loss = grpo_loss + self.sft_loss_weight * sft_loss
         else:
