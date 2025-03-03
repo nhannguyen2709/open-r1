@@ -62,8 +62,12 @@ def get_openai_response(row):
 def main():
     # Read the CSV file
     df = pd.read_parquet("/mnt/weka/lipsync/openr1_int.parquet")
-    # df = df[df['problem_type'].isin(['Calculus', 'Other', 'Inequalities'])]
-    df = df[df['problem_type'].isin(['Logic and Puzzles'])]
+    df_1 = df[df['problem_type'].isin(['Calculus', 'Other', 'Inequalities'])][500:]
+    df_2 = df[df['problem_type'].isin(['Logic and Puzzles'])][250:]
+    df = pd.concat([df_1, df_2], ignore_index=True)
+    # Shuffle the dataframe
+    df = df.sample(frac=1).reset_index(drop=True)
+    print(f"Total rows: {len(df)}")
     for j in range(0, len(df), 8):
         print(f"Processing from row {j}")
         _df = df[j:j+8]
