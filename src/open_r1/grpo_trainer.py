@@ -804,6 +804,9 @@ class GRPOTrainer(Trainer):
             maybe_apply_chat_template(example, self.processing_class)["prompt"]
             for example in inputs
         ]
+
+        # print(f"Message: {prompts[0]}\n\nTemplate: {prompts_text[0]}")
+
         prompt_inputs = self.processing_class(
             prompts_text,
             return_tensors="pt",

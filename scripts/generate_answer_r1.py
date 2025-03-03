@@ -7,7 +7,7 @@ import os
 import json
 from time import time
 import re
-
+from datasets import load_dataset
 # Initialize pandarallel
 pandarallel.initialize(progress_bar=True, nb_workers=8)
 
@@ -36,9 +36,10 @@ def get_openai_response(row):
         response = client.chat.completions.create(
             model=model_name,
             messages=[
-                {"role": "user", "content": row["problem"] + "\nPlease put the final answer within \\boxed{}."},
+                {"role": "system", "content": "You are a helpful and harmless assistant. You are Qwen developed by Alibaba. You should think step-by-step. Return final answer within \\boxed{}, after taking modulo 1000."},
+                {"role": "user", "content": row["problem"]},
             ],
-            temperature=0.7,
+            temperature=0.6,
             top_p=0.8,
             max_tokens=8192,
             extra_body={
@@ -57,16 +58,28 @@ def get_openai_response(row):
         print(f"Error: {e}")
         return None
 
+
 def main():
     # Read the CSV file
-    df = pd.read_parquet("openr1_int.parquet")
-    df = df[:3000]
-    i = 1
-    while i <= 7:
-        print(f"TTA # {i}")
-        df[f"# {i}"] = df.parallel_apply(lambda x: get_openai_response(x), axis=1)
-        i += 1
-        df.to_parquet("openr1_int_sample.parquet", index=False)
+    df = pd.read_parquet("/mnt/weka/lipsync/openr1_int.parquet")
+    # df = df[df['problem_type'].isin(['Calculus', 'Other', 'Inequalities'])]
+    df = df[df['problem_type'].isin(['Logic and Puzzles'])]
+    for j in range(0, len(df), 8):
+        print(f"Processing from row {j}")
+        _df = df[j:j+8]
+        i = 1
+        while i <= 3:
+            _df[f"# {i}"] = _df.parallel_apply(lambda x: get_openai_response(x), axis=1)
+            i += 1
+        try:
+            if os.path.exists("_openr1_int_score.parquet"):
+                existing_df = pd.read_parquet("_openr1_int_score.parquet")
+                combined_df = pd.concat([existing_df, _df], ignore_index=True)
+                combined_df.to_parquet("_openr1_int_score.parquet", index=False)
+            else:
+                _df.to_parquet("_openr1_int_score.parquet", index=False)
+        except:
+            continue
 
     # DEBUG
     # df = df[:1]

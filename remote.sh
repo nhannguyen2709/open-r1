@@ -6,18 +6,18 @@ PROJECT_NAME=$(basename "`pwd`")
 echo "Run training for project $PROJECT_NAME"
 
 /bin/cat <<EOM >$TEMP_FILE
-.mypy_cache/*
 .git/*
 logs/*
 outputs/*
 weights/*
 notebooks/*
+data/*
+.mypy_cache/*
 *.o
 *.so
 *.flac
 *.mp4
 *.jpg
-*.png
 *.tar
 *.dcm
 *.mp3
@@ -26,12 +26,11 @@ notebooks/*
 *.swp
 *.pb
 *.tmp
-*.csv
 *.onnx
 *.zip
 *.parquet
 # *.html
-# *.ipynb
+*.ipynb
 *.feather
 *.pth
 *.wav
@@ -69,14 +68,18 @@ elif [ "$1" == "dev_h100" ]; then
     echo "dev_h100"
     IP="dev_h100"
     REMOTE_HOME="/home/ubuntu/anhpham"
+elif [ "$1" == "dev_h100_2" ]; then
+    echo "dev_h100_2"
+    IP="dev_h100_2"
+    REMOTE_HOME="/home/andrew"
 elif [ "$1" == "dev_h100_dp" ]; then
     echo "dev_h100_dp"
     IP="dev_h100_dp"
     REMOTE_HOME="/home/andrew"
-elif [ "$1" == "dev_a100" ]; then
-    echo "dev_a100"
-    IP="dev_a100"
-    REMOTE_HOME="/home/ubuntu/anhpham"
+elif [ "$1" == "dev_h100_dp_102" ]; then
+    echo "dev_h100_dp_102"
+    IP="dev_h100_dp_102"
+    REMOTE_HOME="/home/andrew"
 else
     echo "Unknown instance"
     exit

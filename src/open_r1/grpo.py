@@ -163,7 +163,7 @@ def main(script_args, training_args, model_args):
     #         dataset[split] = dataset[split].remove_columns("messages")
 
     # train_dataset = dataset[script_args.dataset_train_split]
-    train_dataset = pd.read_parquet("openr1_int_sample_easy_medium.parquet")
+    train_dataset = pd.read_parquet("openr1_int_sample_hard.parquet")
     train_dataset = datasets.Dataset.from_pandas(train_dataset)
 
     train_dataset = train_dataset.map(make_conversation)
