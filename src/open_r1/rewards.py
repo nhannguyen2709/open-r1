@@ -61,8 +61,9 @@ solution_parser = partial(
 
 #     return rewards
 
+
 def extract_boxed_text(text):
-    pattern = r'oxed{(.*?)}'
+    pattern = r"oxed{(.*?)}"
     matches = re.findall(pattern, text)
     if not matches:
         return ""
@@ -81,7 +82,7 @@ def accuracy_reward(completions, answer, **kwargs):
         # print(f"ans: {ans}")
         # We require the answer to be provided in correct latex (no malformed operators)
         answer_parsed = extract_boxed_text(content)
-        
+
         # Reward 1 if the answer_parsed is the same as the ground truth, 0 otherwise
         # print(f"answer_parsed: {answer_parsed}")
         try:
@@ -107,6 +108,7 @@ def accuracy_reward(completions, answer, **kwargs):
 #     print(f"matches: {matches}")
 #     return [1.0 if match else 0.0 for match in matches]
 
+
 def format_reward(completions, **kwargs):
     """Reward function that gives:
     - 0.25 points if </think> tag is present
@@ -115,20 +117,26 @@ def format_reward(completions, **kwargs):
     """
     completion_contents = [completion[0]["content"] for completion in completions]
     rewards = []
-    
+
     for content in completion_contents:
         reward = 0.0
-        if "</think>" in content:
-            reward += 0.25
+        # if "</think>" in content:
+        #     reward += 0.25
+        # if "\\boxed{" in content:
+        #     reward += 0.25
+        # if "</think>" in content and "\\boxed{" in content:
+        #     reward += 0.5
+        if content.count("<think>\n") == 1:
+            reward += 1.0 / 3
+        if content.count("\n</think>\n") == 1:
+            reward += 1.0 / 3
         if "\\boxed{" in content:
-            reward += 0.25
-        if "</think>" in content and "\\boxed{" in content:
-            reward += 0.5
+            reward += 1.0 / 3
         rewards.append(reward)
-    
+
     # print(f"completion_contents: {completion_contents[0]}")
     # print(rewards[0])
-    
+
     return rewards
 
 
@@ -408,11 +416,14 @@ def code_reward(completions, **kwargs) -> list[float]:
 
         evaluate_code(code_snippet, test_cases)
         """
-        code_snippets = [extract_code(completion[-1]["content"]) for completion in completions]
+        code_snippets = [
+            extract_code(completion[-1]["content"]) for completion in completions
+        ]
         verification_info = kwargs["verification_info"]
         scripts = [
             evaluation_script_template.format(
-                code=json.dumps(code), test_cases=json.dumps(json.dumps(info["test_cases"]))
+                code=json.dumps(code),
+                test_cases=json.dumps(json.dumps(info["test_cases"])),
             )
             for code, info in zip(code_snippets, verification_info)
         ]
@@ -440,7 +451,10 @@ def get_code_format_reward(language: str = "python"):
 
     def code_format_reward(completions, **kwargs):
         completion_contents = [completion[0]["content"] for completion in completions]
-        matches = [re.match(pattern, content, re.DOTALL | re.MULTILINE) for content in completion_contents]
+        matches = [
+            re.match(pattern, content, re.DOTALL | re.MULTILINE)
+            for content in completion_contents
+        ]
         return [1.0 if match else 0.0 for match in matches]
 
     return code_format_reward
