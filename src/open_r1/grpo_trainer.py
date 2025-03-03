@@ -25,6 +25,9 @@ import transformers
 from accelerate.utils import gather, gather_object, is_peft_model, set_seed
 from accelerate.utils.other import is_compiled_module
 from datasets import Dataset, IterableDataset
+from liger_kernel.transformers.fused_linear_cross_entropy import (
+    LigerFusedLinearCrossEntropyLoss,
+)
 from packaging import version
 from torch import nn
 from torch.utils.data import Sampler
@@ -77,7 +80,6 @@ if is_wandb_available():
 from open_r1.configs import GRPOConfig
 from open_r1.grpo_loss import LigerFusedLinearGRPOLoss
 from open_r1.monkey_patch import forward_hidden_states
-from torch.nn import CrossEntropyLoss
 
 # What we call a reward function is a callable that takes a list of prompts and completions and returns a list of
 # rewards. When it's a string, it's a model ID, so it's loaded as a pretrained model.
@@ -453,8 +455,10 @@ class GRPOTrainer(Trainer):
         self.liger_grpo_loss = LigerFusedLinearGRPOLoss(
             beta=args.beta, epsilon=args.epsilon, compiled=True
         )
-        self.sft_loss_fct = CrossEntropyLoss(reduction='mean')
-        self.sft_loss_weight = getattr(args, "sft_loss_weight", 1.0)  # Default weight for SFT loss
+        self.sft_loss_fct = LigerFusedLinearCrossEntropyLoss(reduction="sum")
+        self.sft_loss_weight = getattr(
+            args, "sft_loss_weight", 1.0
+        )  # Default weight for SFT loss
 
         super().__init__(
             model=model,
@@ -804,15 +808,11 @@ class GRPOTrainer(Trainer):
     ) -> dict[str, Union[torch.Tensor, Any]]:
         device = self.accelerator.device
         prompts = [x["prompt"] for x in inputs]
-        reasoning_gt = [random.choice(x["filter_generations"]) if "filter_generations" in x else "" for x in inputs]
-        reasoning_gt = [x.split("<think>\n")[1] for x in reasoning_gt]
-        # print(f"Reasoning GT: {reasoning_gt[0][:50]}...{reasoning_gt[0][-50:]}")
+
         prompts_text = [
             maybe_apply_chat_template(example, self.processing_class)["prompt"]
             for example in inputs
         ]
-        # print(f"Message: {prompts[0]}\n\nTemplate: {prompts_text[0]}")
-
         prompt_inputs = self.processing_class(
             prompts_text,
             return_tensors="pt",
@@ -825,19 +825,9 @@ class GRPOTrainer(Trainer):
             prompt_inputs["input_ids"],
             prompt_inputs["attention_mask"],
         )
-
         if self.max_prompt_length is not None:
             prompt_ids = prompt_ids[:, -self.max_prompt_length :]
             prompt_mask = prompt_mask[:, -self.max_prompt_length :]
-
-        reasoning_gt = self.processing_class(
-            reasoning_gt,
-            return_tensors="pt",
-            padding=True,
-            padding_side="right",
-            add_special_tokens=False,
-        )
-        reasoning_gt = super()._prepare_inputs(reasoning_gt)
 
         # Generate completions using either vLLM or regular generation
         if self.args.use_vllm:
@@ -885,7 +875,7 @@ class GRPOTrainer(Trainer):
             completion_ids = pad(
                 completion_ids, padding_value=self.processing_class.pad_token_id
             )
-            prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+            # prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         else:
             # Regular generation path
             with unwrap_model_for_generation(
@@ -915,13 +905,6 @@ class GRPOTrainer(Trainer):
         )
         completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
 
-        # Concatenate prompt_mask with completion_mask for logit computation
-        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  # (B, P+C)
-
-        logits_to_keep = completion_ids.size(
-            1
-        )  # we only need to compute the logits for the completion tokens
-
         # Decode the generated completions
         completions_text = self.processing_class.batch_decode(
             completion_ids, skip_special_tokens=True
@@ -937,6 +920,65 @@ class GRPOTrainer(Trainer):
                 )
         else:
             completions = completions_text
+
+        sft_prompt_ids = None
+        sft_prompt_mask = None
+        sft_completion_ids = None
+        sft_completion_mask = None
+        if self.sft_loss_weight > 0 and not self.control.should_evaluate:
+            generations = [x["filter_generations"] for x in inputs]
+            sft_prompts_text = []
+            sft_completions = []
+            for prompt_text, candidates in zip(prompts_text, generations):
+                if prompt_text in sft_prompts_text:
+                    continue
+                sft_prompts_text.extend([prompt_text] * len(candidates))
+                sft_completions.extend(candidates)
+            sft_prompt_inputs = self.processing_class(
+                sft_prompts_text,
+                return_tensors="pt",
+                padding=True,
+                padding_side="left",
+                add_special_tokens=False,
+            )
+            sft_prompt_inputs = super()._prepare_inputs(sft_prompt_inputs)
+            sft_prompt_ids, sft_prompt_mask = (
+                sft_prompt_inputs["input_ids"],
+                sft_prompt_inputs["attention_mask"],
+            )
+            sft_prompt_ids = sft_prompt_ids[:, -self.max_prompt_length :]
+            sft_prompt_mask = sft_prompt_mask[:, -self.max_prompt_length :]
+            sft_completion_inputs = self.processing_class(
+                sft_completions, add_special_tokens=False
+            )
+            max_sft_completion_length = (
+                self.processing_class.model_max_length - sft_prompt_ids.size(1) - 1
+            )
+            for i in range(len(sft_completions)):
+                input_ids = sft_completion_inputs["input_ids"][i][
+                    -max_sft_completion_length:
+                ]
+                input_mask = sft_completion_inputs["attention_mask"][i][
+                    -max_sft_completion_length:
+                ]
+                sft_completion_inputs["input_ids"][i] = torch.LongTensor(
+                    input_ids + [self.processing_class.eos_token_id]
+                )
+                sft_completion_inputs["attention_mask"][i] = torch.LongTensor(
+                    input_mask + [1]
+                )
+            sft_completion_inputs["input_ids"] = pad(
+                sft_completion_inputs["input_ids"],
+                padding_value=self.processing_class.pad_token_id,
+            )
+            sft_completion_inputs["attention_mask"] = pad(
+                sft_completion_inputs["attention_mask"], padding_value=0
+            )
+            sft_completion_inputs = super()._prepare_inputs(sft_completion_inputs)
+            sft_completion_ids, sft_completion_mask = (
+                sft_completion_inputs["input_ids"],
+                sft_completion_inputs["attention_mask"],
+            )
 
         rewards_per_func = torch.zeros(
             len(prompts), len(self.reward_funcs), device=device
@@ -1075,8 +1117,10 @@ class GRPOTrainer(Trainer):
             "prompt_mask": prompt_mask,
             "completion_ids": completion_ids,
             "completion_mask": completion_mask,
-            "reasoning_gt_ids": reasoning_gt["input_ids"],
-            "reasoning_gt_mask": reasoning_gt["attention_mask"],
+            "sft_prompt_ids": sft_prompt_ids,
+            "sft_prompt_mask": sft_prompt_mask,
+            "sft_completion_ids": sft_completion_ids,
+            "sft_completion_mask": sft_completion_mask,
             "advantages": advantages,
         }
 
@@ -1106,37 +1150,25 @@ class GRPOTrainer(Trainer):
     ):
         if return_outputs:
             raise ValueError("The GRPOTrainer does not support returning outputs")
-        # Compute the per-token log probabilities for the model
 
+        mode = "eval" if self.control.should_evaluate else "train"
+        # Compute the per-token log probabilities for the model
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
         completion_ids, completion_mask = (
             inputs["completion_ids"],
             inputs["completion_mask"],
         )
-        reasoning_gt_ids, reasoning_gt_mask = (
-            inputs["reasoning_gt_ids"],
-            inputs["reasoning_gt_mask"],
-        )
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
-        completion_size = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
-
-        input_ids_sft = torch.cat([prompt_ids, reasoning_gt_ids], dim=1)
-        attention_mask_sft = torch.cat([prompt_mask, reasoning_gt_mask], dim=1)
-        completion_size_sft = reasoning_gt_ids.size(1)
+        completion_size = completion_ids.size(
+            1
+        )  # we only need to compute the logits for the completion tokens
 
         model_kwargs = {"output_hidden_states": True, "return_dict": False}
         with torch.cuda.device(model.device):
             outputs = model(input_ids, attention_mask, **model_kwargs)
             hidden_states = outputs[0]
 
-            # Compute logits for SFT loss for training only
-            if self.sft_loss_weight > 0 and not self.control.should_evaluate:
-                outputs_sft = model(input_ids_sft, attention_mask_sft, **model_kwargs)
-                hidden_states_sft = outputs_sft[0]
-                logits_sft = model.lm_head(hidden_states_sft)  # Get logits for all tokens
-                logits_sft = logits_sft[:, :-1, :]  # Shift to align with targets
-        
         with torch.inference_mode():
             if self.ref_model is not None:
                 with torch.cuda.device(self.ref_model.device):
@@ -1175,34 +1207,40 @@ class GRPOTrainer(Trainer):
             ref_weight,
             inputs.get("old_per_token_logps", None),
         )
-        
-        # Compute the SFT loss if weight > 0
-        sft_loss = 0
+
         if self.sft_loss_weight > 0 and not self.control.should_evaluate:
-            # Extract only the completion part of the logits
-            completion_logits_sft = logits_sft[:, -completion_size_sft:, :]
-            # Shifted by one position
-            target_ids_sft = input_ids_sft[:, 1:].contiguous()
-            # Apply attention mask to exclude padding tokens
-            active_mask_sft = attention_mask_sft[:, 1:].bool()
-            active_logits_sft = completion_logits_sft.view(-1, completion_logits_sft.size(-1))
-            active_labels_sft = torch.where(
-                active_mask_sft.view(-1),
-                target_ids_sft.view(-1),
-                -100  # Ignore padding tokens in loss calculation
+            # Compute logits for SFT loss for training only
+            sft_prompt_ids, sft_prompt_mask = (
+                inputs["sft_prompt_ids"],
+                inputs["sft_prompt_mask"],
             )
-            sft_loss = self.sft_loss_fct(active_logits_sft, active_labels_sft)
-            
+            sft_completion_ids, sft_completion_mask = (
+                inputs["sft_completion_ids"],
+                inputs["sft_completion_mask"],
+            )
+            sft_input_ids = torch.cat([sft_prompt_ids, sft_completion_ids], dim=1)
+            sft_attention_mask = torch.cat(
+                [sft_prompt_mask, sft_completion_mask], dim=1
+            )
+            sft_completion_size = sft_completion_ids.size(1)
+            sft_hidden_states = model(
+                sft_input_ids, sft_attention_mask, **model_kwargs
+            )[0]
+            sft_hidden_states = sft_hidden_states[:, :-1][
+                :, -sft_completion_size:
+            ].flatten(0, 1)
+            sft_labels = sft_input_ids[:, 1:][:, -sft_completion_size:].flatten()
+            sft_loss = self.sft_loss_fct(weight, sft_hidden_states, sft_labels)
+            if self.sft_loss_fct.reduction == "sum":
+                sft_loss /= sft_completion_mask.sum()
             # Log SFT loss
-            mode = "eval" if self.control.should_evaluate else "train"
             self._metrics[mode]["sft_loss"].append(
                 self.accelerator.gather_for_metrics(sft_loss).mean().item()
             )
-        
-        # Combine the losses
-        total_loss = grpo_loss + self.sft_loss_weight * sft_loss
+            total_loss = grpo_loss + self.sft_loss_weight * sft_loss
+        else:
+            total_loss = grpo_loss
 
-        mode = "eval" if self.control.should_evaluate else "train"
         mean_kl = metrics[3]
         self._metrics[mode]["kl"].append(
             self.accelerator.gather_for_metrics(mean_kl).mean().item()
@@ -1220,7 +1258,7 @@ class GRPOTrainer(Trainer):
                 "old_per_token_logps"
             ] = old_per_token_logps
             self._step += 1  # increment every forward + backward
-            
+
         return total_loss
 
     def prediction_step(
