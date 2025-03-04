@@ -969,7 +969,7 @@ class GRPOTrainer(Trainer):
                 )
             sft_completion_inputs["input_ids"] = pad(
                 sft_completion_inputs["input_ids"],
-                padding_value=-100,
+                padding_value=self.processing_class.pad_token_id,
             )
             sft_completion_inputs["attention_mask"] = pad(
                 sft_completion_inputs["attention_mask"], padding_value=0
@@ -1229,7 +1229,8 @@ class GRPOTrainer(Trainer):
             sft_hidden_states = sft_hidden_states[:, :-1][
                 :, -sft_completion_size:
             ].flatten(0, 1)
-            sft_labels = sft_input_ids[:, 1:][:, -sft_completion_size:].flatten()
+            sft_labels = torch.where(sft_attention_mask == 0, -100, sft_input_ids)
+            sft_labels = sft_labels[:, 1:][:, -sft_completion_size:].flatten()
             sft_loss = self.sft_loss_fct(weight, sft_hidden_states, sft_labels)
             if self.sft_loss_fct.reduction == "sum":
                 sft_loss /= sft_completion_mask.sum()
