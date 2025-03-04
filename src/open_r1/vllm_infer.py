@@ -24,8 +24,8 @@ warnings.simplefilter('ignore')
 os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+# llm_model_pth = "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B"
 llm_model_pth = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
-# llm_model_pth = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
 
 MAX_NUM_SEQS = 8
 MAX_MODEL_LEN = 8192
@@ -40,7 +40,7 @@ llm = LLM(
     gpu_memory_utilization=0.95,  # The ratio (between 0 and 1) of GPU memory to reserve for the model
     seed=2024,
     enable_lora=True,
-    max_lora_rank=32,
+    max_lora_rank=256,
 )
 
 tokenizer = llm.get_tokenizer()
@@ -82,6 +82,7 @@ def batch_message_generate(list_of_messages) -> list[list[dict]]:
         min_p=0.01,
         skip_special_tokens=True,     # Whether to skip special tokens in the output
         max_tokens=max_tokens,
+        stop="</think>"
     )
     list_of_texts = [
         tokenizer.apply_chat_template(
@@ -97,7 +98,8 @@ def batch_message_generate(list_of_messages) -> list[list[dict]]:
     request_output = llm.generate(
         prompts=list_of_texts,
         sampling_params=sampling_params,
-        lora_request=LoRARequest("my_adapter", 1, "data/Qwen-2.5-7B-Simple-RL-5/best-ckpt")
+        lora_request=LoRARequest("my_adapter", 1, "data/Qwen-7B-Simple-RL/checkpoint-100"),
+
     )
 
     print([len(single_request_output.outputs[0].token_ids) for single_request_output in request_output])
@@ -106,7 +108,7 @@ def batch_message_generate(list_of_messages) -> list[list[dict]]:
 
     for messages, single_request_output in zip(list_of_messages, request_output):
         # print()
-        # print(single_request_output.outputs[0].text)
+        print(f"{single_request_output.outputs[0].text[:50]}...{single_request_output.outputs[0].text[-50:]}")
         # print()
         messages.append({'role': 'assistant', 'content': single_request_output.outputs[0].text})
 
