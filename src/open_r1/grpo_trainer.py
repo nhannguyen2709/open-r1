@@ -16,7 +16,7 @@ import os
 import textwrap
 import warnings
 from collections import defaultdict
-from typing import Any, Callable, Optional, Sized, Union
+from typing import Any, Callable, Dict, Optional, Sized, Union
 from unittest.mock import patch
 
 import torch
@@ -43,6 +43,7 @@ from transformers import (
     is_wandb_available,
 )
 from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
+from transformers.trainer import logger
 from transformers.utils import is_peft_available
 
 from trl.data_utils import (
@@ -65,7 +66,6 @@ from trl.trainer.utils import (
     pad,
     selective_log_softmax,
 )
-import random
 
 if is_peft_available():
     from peft import PeftConfig, get_peft_model
@@ -510,93 +510,39 @@ class GRPOTrainer(Trainer):
                     "vLLM is not available and `use_vllm` is set to True. Please install vLLM with "
                     "`pip install vllm` to use it."
                 )
-            if self.args.vllm_worker_num > self.accelerator.num_processes:
-                raise ValueError(
-                    f"The requested number of workers for vllm (i.e., {self.args.vllm_worker_num}) should be no larger "
-                    f"than the number of your training processes (i.e., {self.accelerator.num_processes}) "
-                )
-            rank = self.accelerator.process_index
-            if rank < self.args.vllm_worker_num:
-                vllm_device = self.args.vllm_device
-                if vllm_device == "auto":
-                    if torch.cuda.device_count() == 1:
-                        vllm_device = "cuda:0"  # particular case when training with onyl 1 GPU: share it
-                    else:
-                        vllm_device = f"cuda:{self.accelerator.num_processes+rank}"
-                # Check that the requested device is available
-                if (
-                    vllm_device.split(":")[0] == "cuda"
-                    and int(vllm_device.split(":")[1]) >= torch.cuda.device_count()
-                ):
-                    raise ValueError(
-                        f"The requested device for vllm ({vllm_device}) is not available. You are likely using vLLM "
-                        "without restricting the number of GPUs for training. Set the `--num_processes` argument to a "
-                        "value lower than the number of GPUs available on your machine—typically, reducing it by one "
-                        f"is sufficient. In your case: `--num_processes {torch.cuda.device_count() - 1}`."
-                    )
-                # Check that the requested device is not also used for training
-                if vllm_device in {
-                    f"cuda:{idx}" for idx in range(self.accelerator.num_processes)
-                }:
-                    warnings.warn(
-                        f"The requested device {vllm_device} is also being used for training. For higher throughput "
-                        "and to avoid out-of-memory errors, it is recommended to use a dedicated device for vLLM. "
-                        "If this is intentional, you may ignore this warning but should adjust "
-                        "`vllm_gpu_memory_utilization` accordingly."
-                    )
-                # vLLM is not compatible with accelerate. So we need to patch it to make sure we can (1) initilizing vLLM
-                # model on the desired device (world_size_patch, get_rank_patch, new_group_patch, get_backend_patch) without
-                # conflicts and (2) avoid a test that is not designed for our setting (profiling_patch).
-                world_size_patch = patch(
-                    "torch.distributed.get_world_size", return_value=1
-                )
-                profiling_patch = patch(
-                    "vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling",
-                    return_value=None,
-                )
-                get_rank_patch = patch("torch.distributed.get_rank", return_value=0)
-                new_group_patch = patch(
-                    "torch.distributed.new_group",
-                    return_value=type("DummyGroup", (), {})(),
-                )
-                get_backend_patch = patch(
-                    "torch.distributed.get_backend", lambda _: "gloo"
-                )
-                with (
-                    world_size_patch
-                ), get_rank_patch, new_group_patch, get_backend_patch, profiling_patch:
-                    print(
-                        f"Initializing vLLM on {vllm_device} from accelerator rank {rank}"
-                    )
-                    self.llm = LLM(
-                        model=model.name_or_path,
-                        device=vllm_device,
-                        gpu_memory_utilization=self.args.vllm_gpu_memory_utilization,
-                        dtype=self.args.vllm_dtype,
-                        # Automatic Prefix Caching caches the KV cache of existing queries, so that a new query can
-                        # directly reuse the KV cache if it shares the same prefix with one of the existing queries.
-                        # This is particularly useful here because we generate completions from the same prompts.
-                        enable_prefix_caching=self.args.vllm_enable_prefix_caching,
-                        max_model_len=self.args.vllm_max_model_len,
-                        enforce_eager=self.args.vllm_enforce_eager,
-                    )
-                    self.llm_device = vllm_device
+            vllm_device = f"cuda:{self.accelerator.process_index}"
+            self.llm = LLM(
+                model=model.name_or_path,
+                device=vllm_device,
+                gpu_memory_utilization=self.args.vllm_gpu_memory_utilization,
+                dtype=self.args.vllm_dtype,
+                # Automatic Prefix Caching caches the KV cache of existing queries, so that a new query can
+                # directly reuse the KV cache if it shares the same prefix with one of the existing queries.
+                # This is particularly useful here because we generate completions from the same prompts.
+                enable_prefix_caching=self.args.vllm_enable_prefix_caching,
+                max_model_len=self.args.vllm_max_model_len,
+                enforce_eager=self.args.vllm_enforce_eager,
+                tensor_parallel_size=1,
+                distributed_executor_backend="external_launcher",
+                enable_sleep_mode=True,
+            )
+            self.llm_device = vllm_device
 
-                # Guided decoding, if enabled
-                if args.vllm_guided_decoding_regex is not None:
-                    guided_decoding = GuidedDecodingParams(
-                        backend="outlines", regex=args.vllm_guided_decoding_regex
-                    )
-                else:
-                    guided_decoding = None
-
-                # Sampling parameters
-                self.sampling_params = SamplingParams(
-                    temperature=args.temperature,
-                    max_tokens=self.max_completion_length,
-                    guided_decoding=guided_decoding,
-                    n=args.num_generations,
+            # Guided decoding, if enabled
+            if args.vllm_guided_decoding_regex is not None:
+                guided_decoding = GuidedDecodingParams(
+                    backend="outlines", regex=args.vllm_guided_decoding_regex
                 )
+            else:
+                guided_decoding = None
+
+            # Sampling parameters
+            self.sampling_params = SamplingParams(
+                temperature=args.temperature,
+                max_tokens=self.max_completion_length,
+                guided_decoding=guided_decoding,
+                n=args.num_generations,
+            )
 
             self._last_loaded_step = (
                 0  # tag to avoid useless loading during grad accumulation
@@ -777,22 +723,14 @@ class GRPOTrainer(Trainer):
                 }
             else:
                 state_dict = unwrapped_model.state_dict()
-            if self.accelerator.process_index < self.args.vllm_worker_num:
-                llm_model = (
-                    self.llm.llm_engine.model_executor.driver_worker.model_runner.model
-                )
-                llm_model.load_weights(state_dict.items())
+            llm_model = (
+                self.llm.llm_engine.model_executor.driver_worker.model_runner.model
+            )
+            llm_model.load_weights(state_dict.items())
             # Unmerge the adapter to restore the model to its original state.
             # This must be done after loading weights to ensure they correspond to the merged state.
             if is_peft_model(unwrapped_model):
                 unwrapped_model.unmerge_adapter()
-
-    def _split_vllm_inputs(self, ordered_set_of_prompts, n_splits):
-        size = (len(ordered_set_of_prompts) + 1) // n_splits
-        data = [
-            ordered_set_of_prompts[size * i : size * (i + 1)] for i in range(n_splits)
-        ]
-        return data
 
     def _vllm_generation(self, ordered_set_of_prompts):
         with torch.cuda.device(self.llm_device):
@@ -831,51 +769,29 @@ class GRPOTrainer(Trainer):
 
         # Generate completions using either vLLM or regular generation
         if self.args.use_vllm:
-            vllm_index = self.accelerator.process_index
-            n_vllms = self.args.vllm_worker_num
-            # First, have main process load weights if needed
+            # Wake-up the model and load weights if needed
+            self.llm.wake_up()
             if self.state.global_step != self._last_loaded_step:
                 self._move_model_to_vllm()
                 self._last_loaded_step = self.state.global_step
 
-            # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
-            all_prompts_text = gather_object(prompts_text)
-            if vllm_index < n_vllms:
-                # Since 'prompts' contains 'num_generations' duplicates, we first take unique prompts, and generate
-                # num_generations outputs for each one. This is faster than generating outputs for each duplicate
-                # prompt individually.
-                ordered_set_of_prompts = list(dict.fromkeys(all_prompts_text))
-                # spliting the prompts into N subsets according to the number of vllm processes
-                split_ordered_prompts = self._split_vllm_inputs(
-                    ordered_set_of_prompts, n_vllms
-                )
-                subset_results = self._vllm_generation(
-                    split_ordered_prompts[vllm_index]
-                )
-                completion_ids_subset = []
-                for outputs in subset_results:
-                    for output in outputs.outputs:
-                        completion_ids_subset.append(output.token_ids)
-            else:
-                completion_ids_subset = [None]
-            # gather the completions from vllm processes to all processes, ensuring each process receives its
-            # corresponding slice.
-            completion_ids = gather_object(completion_ids_subset)
-            completion_ids = [seq for seq in completion_ids if seq is not None]
-            process_slice = slice(
-                self.accelerator.process_index * len(prompts),
-                (self.accelerator.process_index + 1) * len(prompts),
-            )
-            completion_ids = completion_ids[process_slice]
+            # Generate completions using vLLM
+            ordered_set_of_prompts = list(dict.fromkeys(prompts_text))
+            results = self._vllm_generation(ordered_set_of_prompts)
+            completion_ids = []
+            for result in results:
+                for output in result.outputs:
+                    completion_ids.append(
+                        torch.tensor(output.token_ids, device=self.llm_device)
+                    )
+
+            # Sleep to release memory
+            self.llm.sleep()
 
             # Pad the completions, and concatenate them with the prompts
-            completion_ids = [
-                torch.tensor(ids, device=device) for ids in completion_ids
-            ]
             completion_ids = pad(
                 completion_ids, padding_value=self.processing_class.pad_token_id
             )
-            # prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         else:
             # Regular generation path
             with unwrap_model_for_generation(
@@ -1131,10 +1047,18 @@ class GRPOTrainer(Trainer):
         mode = "eval" if self.control.should_evaluate else "train"
         if mode == "train":
             if self.state.global_step % self.num_iterations == 0:
+                self.offload_states()
+                logger.info(
+                    f"Offloaded policy model and optimizer states to CPU at training step {self._step}"
+                )
                 inputs = self._generate_and_score_completions(inputs)
                 self._buffered_inputs[
                     self._step % self.args.gradient_accumulation_steps
                 ] = inputs
+                self.reload_states()
+                logger.info(
+                    f"Reloaded policy model and optimizer states back to GPU at training step {self._step}"
+                )
             else:
                 inputs = self._buffered_inputs[
                     self._step % self.args.gradient_accumulation_steps
@@ -1267,6 +1191,29 @@ class GRPOTrainer(Trainer):
 
         return total_loss
 
+    def _inner_training_loop(
+        self,
+        batch_size=None,
+        args=None,
+        resume_from_checkpoint=None,
+        trial=None,
+        ignore_keys_for_eval=None,
+    ):
+        if resume_from_checkpoint is not None:
+            rank = self.accelerator.process_index
+            buffer_cpu = torch.load(
+                os.path.join(resume_from_checkpoint, f"buffered_inputs_{rank}.pt")
+            )
+            self._buffered_inputs = [
+                {k: v.to(self.accelerator.device) for k, v in inputs.items()}
+                for inputs in buffer_cpu
+            ]
+            global_step = int(resume_from_checkpoint.split("-")[-1])
+            self._step = global_step * self.args.gradient_accumulation_steps
+        return super()._inner_training_loop(
+            batch_size, args, resume_from_checkpoint, trial, ignore_keys_for_eval
+        )
+
     def prediction_step(
         self,
         model,
@@ -1309,28 +1256,33 @@ class GRPOTrainer(Trainer):
         rank = self.accelerator.process_index
         torch.save(buffer_cpu, os.path.join(output_dir, f"buffered_inputs_{rank}.pt"))
 
-    def _inner_training_loop(
-        self,
-        batch_size=None,
-        args=None,
-        resume_from_checkpoint=None,
-        trial=None,
-        ignore_keys_for_eval=None,
-    ):
-        if resume_from_checkpoint is not None:
-            rank = self.accelerator.process_index
-            buffer_cpu = torch.load(
-                os.path.join(resume_from_checkpoint, f"buffered_inputs_{rank}.pt")
-            )
-            self._buffered_inputs = [
-                {k: v.to(self.accelerator.device) for k, v in inputs.items()}
-                for inputs in buffer_cpu
-            ]
-            global_step = int(resume_from_checkpoint.split("-")[-1])
-            self._step = global_step * self.args.gradient_accumulation_steps
-        return super()._inner_training_loop(
-            batch_size, args, resume_from_checkpoint, trial, ignore_keys_for_eval
-        )
+    @torch.no_grad()
+    def offload_states(self):
+        """
+        Offload policy model and optimizer states to CPU.
+        """
+        # TODO: Handle deepspeed zero3
+        self.model.to("cpu", non_blocking=True)
+        for param_group in self.optimizer.param_groups:
+            for param in param_group["params"]:
+                param.data = param.data.to("cpu", non_blocking=True)
+        torch.cuda.empty_cache()
+        torch.distributed.barrier()
+        torch.cuda.synchronize()
+
+    @torch.no_grad()
+    def reload_states(self):
+        """
+        Reload policy model and optimizer states back to GPU.
+        This is called after vLLM generation is complete and we need to resume policy training.
+        """
+        self.model.to(self.accelerator.device, non_blocking=True)
+        for param_group in self.optimizer.param_groups:
+            for param in param_group["params"]:
+                param.data = param.data.to(self.accelerator.device, non_blocking=True)
+        torch.cuda.empty_cache()
+        torch.distributed.barrier()
+        torch.cuda.synchronize()
 
     def create_model_card(
         self,
