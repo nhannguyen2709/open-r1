@@ -1064,8 +1064,10 @@ class GRPOTrainer(Trainer):
                     self._step % self.args.gradient_accumulation_steps
                 ]
         else:
+            self.offload_states()
             # In evaluation, we don't reuse completions across multiple updates, so we don't need to buffer inputs.
             inputs = self._generate_and_score_completions(inputs)
+            self.reload_states()
         return inputs
 
     @profiling_decorator
