@@ -90,7 +90,7 @@ class GRPOScriptArguments(ScriptArguments):
         metadata={"help": "Maximum reward for correct answers"},
     )
     cosine_max_len: int = field(
-        default=1000,
+        default=12288,
         metadata={"help": "Maximum length for scaling"},
     )
     repetition_n_grams: int = field(
@@ -164,6 +164,7 @@ def main(script_args, training_args, model_args):
 
     # train_dataset = dataset[script_args.dataset_train_split]
     train_dataset = pd.read_parquet("openr1_int_sample_hard_full.parquet")
+    train_dataset = train_dataset[train_dataset['filter_generations'].apply(len) > 0]
     train_dataset = datasets.Dataset.from_pandas(train_dataset)
 
     train_dataset = train_dataset.map(make_conversation)
@@ -183,17 +184,17 @@ def main(script_args, training_args, model_args):
         "accuracy": accuracy_reward,
         "format": format_reward,
         # "reasoning_steps": reasoning_steps_reward,
-        # "cosine": get_cosine_scaled_reward(
-        #     min_value_wrong=script_args.cosine_min_value_wrong,
-        #     max_value_wrong=script_args.cosine_max_value_wrong,
-        #     min_value_correct=script_args.cosine_min_value_correct,
-        #     max_value_correct=script_args.cosine_max_value_correct,
-        #     max_len=script_args.cosine_max_len,
-        # ),
-        # "repetition_penalty": get_repetition_penalty_reward(
-        #     ngram_size=script_args.repetition_n_grams,
-        #     max_penalty=script_args.repetition_max_penalty,
-        # ),
+        "cosine": get_cosine_scaled_reward(
+            min_value_wrong=script_args.cosine_min_value_wrong,
+            max_value_wrong=script_args.cosine_max_value_wrong,
+            min_value_correct=script_args.cosine_min_value_correct,
+            max_value_correct=script_args.cosine_max_value_correct,
+            max_len=script_args.cosine_max_len,
+        ),
+        "repetition_penalty": get_repetition_penalty_reward(
+            ngram_size=script_args.repetition_n_grams,
+            max_penalty=script_args.repetition_max_penalty,
+        ),
         # "length": len_reward,
     }
     reward_funcs = [REWARD_FUNCS_REGISTRY[func] for func in script_args.reward_funcs]
@@ -238,6 +239,9 @@ def main(script_args, training_args, model_args):
         checkpoint = training_args.resume_from_checkpoint
     elif last_checkpoint is not None:
         checkpoint = last_checkpoint
+    print("Load checkpoint manually")
+    _checkpoint = "data/Qwen-7B-Simple-RL/checkpoint-100"
+    trainer.model.load_adapter(_checkpoint, "peft", is_trainable=True)
     train_result = trainer.train(resume_from_checkpoint=checkpoint)
     metrics = train_result.metrics
     metrics["train_samples"] = len(train_dataset)

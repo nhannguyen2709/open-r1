@@ -239,7 +239,7 @@ def get_cosine_scaled_reward(
     max_value_correct: float = 1.0,
     max_len: int = 1000,
 ):
-    def cosine_scaled_reward(completions, solution, **kwargs):
+    def cosine_scaled_reward(completions, answer, **kwargs):
         """Reward function that scales based on completion length using a cosine schedule.
 
         Shorter correct solutions are rewarded more than longer ones.
@@ -259,37 +259,18 @@ def get_cosine_scaled_reward(
         contents = [completion[0]["content"] for completion in completions]
         rewards = []
 
-        for content, sol in zip(contents, solution):
-            gold_parsed = parse(
-                sol,
-                extraction_mode="first_match",
-                extraction_config=[LatexExtractionConfig()],
-            )
-            if len(gold_parsed) == 0:
-                rewards.append(1.0)  # Skip unparseable examples
-                print("Failed to parse gold solution: ", sol)
-                continue
+        for content, ans in zip(contents, answer):
+            answer_parsed = extract_boxed_text(content)
 
-            answer_parsed = parse(
-                content,
-                extraction_config=[
-                    LatexExtractionConfig(
-                        normalization_config=NormalizationConfig(
-                            nits=False,
-                            malformed_operators=False,
-                            basic_latex=True,
-                            equations=True,
-                            boxed=True,
-                            units=True,
-                        ),
-                        boxed_match_priority=0,
-                        try_extract_without_anchor=False,
-                    )
-                ],
-                extraction_mode="first_match",
-            )
+            # Reward 1 if the answer_parsed is the same as the ground truth, 0 otherwise
+            # print(f"answer_parsed: {answer_parsed}")
+            try:
+                parsed_value = float(answer_parsed) if answer_parsed else -1e9
+                _reward = float(int(parsed_value) == int(ans))
+            except ValueError:
+                _reward = 0.0
 
-            is_correct = verify(answer_parsed, gold_parsed)
+            is_correct = bool(_reward)
             gen_len = len(content)
 
             # Apply cosine scaling based on length
