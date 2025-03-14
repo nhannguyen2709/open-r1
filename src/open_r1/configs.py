@@ -72,6 +72,9 @@ class GRPOConfig(trl.GRPOConfig):
     vllm_max_model_len: int = field(
         default=8192, metadata={"help": "The maximum model length."}
     )
+    vllm_tensor_parallel_size: int = field(
+        default=1, metadata={"help": "The number of tensor parallel size."}
+    )
     wandb_entity: Optional[str] = field(
         default=None,
         metadata={"help": ("The entity to store runs under.")},
