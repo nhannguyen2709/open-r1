@@ -1,6 +1,6 @@
 # Model arguments
 model_name_or_path: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
-output_dir: data/Qwen-7B-Simple-RL-v3
+output_dir: data/Qwen-7B-GRPO-v2
 model_revision: main
 torch_dtype: bfloat16
 attn_implementation: flash_attention_2
@@ -34,10 +34,10 @@ lora_target_modules:
 
 warmup_ratio: 0.05
 gradient_accumulation_steps: 8
-learning_rate: 2.0e-5
+learning_rate: 4.0e-5
 lr_scheduler_type: cosine_with_min_lr
 lr_scheduler_kwargs:
-  min_lr_rate: 0.01
+  min_lr_rate: 0.1
 num_iterations: 4
 num_generations: 4
 max_prompt_length: 512
@@ -48,10 +48,8 @@ per_device_train_batch_size: 4
 # GRPO trainer config
 temperature: 0.6
 bf16: true
-use_vllm: true
-vllm_device: auto
-vllm_gpu_memory_utilization: 0.48
-vllm_enable_prefix_caching: true
+vllm_gpu_memory_utilization: 0.6
+vllm_tensor_parallel_size: 2
 
 num_train_epochs: 2
 
