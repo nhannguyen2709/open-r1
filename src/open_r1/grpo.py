@@ -20,6 +20,7 @@ import torch
 from datasets import load_dataset
 import datasets
 from transformers import set_seed
+from transformers.trainer import logger
 from transformers.trainer_utils import get_last_checkpoint
 from trl import ScriptArguments, TrlParser, get_peft_config
 
@@ -36,7 +37,9 @@ from open_r1.rewards import (
 )
 from open_r1.utils import get_tokenizer
 from open_r1.utils.callbacks import get_callbacks
-from open_r1.grpo_trainer import GRPOTrainer
+
+# from open_r1.grpo_trainer import GRPOTrainer
+from open_r1.faster_grpo_trainer import FastGRPOTrainer as GRPOTrainer
 from open_r1.utils.model_utils import get_quantization_config, get_tokenizer
 from open_r1.utils.wandb_logging import init_wandb_training
 
@@ -99,9 +102,7 @@ class GRPOScriptArguments(ScriptArguments):
     )
     repetition_max_penalty: float = field(
         default=-1.0,
-        metadata={
-            "help": "Maximum (negative) penalty for for repetition penalty reward"
-        },
+        metadata={"help": "Maximum (negative) penalty for for repetition penalty reward"},
     )
 
 
@@ -137,12 +138,6 @@ def main(script_args, training_args, model_args):
     if "wandb" in training_args.report_to:
         init_wandb_training(training_args)
 
-    # Load the dataset
-    # dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
-    eval_dataset = None
-    if training_args.eval_strategy != "no":
-        eval_dataset = load_dataset("Maxwell-Jia/AIME_2024", split="train")
-
     # Format into conversation
     def make_conversation(example):
         prompt = []
@@ -150,30 +145,27 @@ def main(script_args, training_args, model_args):
         if training_args.system_prompt is not None:
             prompt.append({"role": "system", "content": training_args.system_prompt})
 
-        prompt.append({"role": "user", "content": example["problem"] + "\nPlease put the final answer within \\boxed{}."})
+        prompt.append(
+            {
+                "role": "user",
+                "content": example["problem"] + "\nPlease put the final answer within \\boxed{}.",
+            }
+        )
         return {"prompt": prompt}
 
-    # dataset = dataset.map(make_conversation, num_proc=4)
-    # dataset[script_args.dataset_train_split] = dataset[
-    #     script_args.dataset_train_split
-    # ].select(range(100))
-
-    # for split in dataset:
-    #     if "messages" in dataset[split].column_names:
-    #         dataset[split] = dataset[split].remove_columns("messages")
-
-    # train_dataset = dataset[script_args.dataset_train_split]
-    train_dataset = pd.read_parquet("openr1_int_sample_hard_full.parquet")
-    train_dataset = train_dataset[train_dataset['filter_generations'].apply(len) > 0]
-    train_dataset = datasets.Dataset.from_pandas(train_dataset)
-
+    ################
+    # Load the dataset
+    ################
+    train_dataset = load_dataset(script_args.dataset_name, split=script_args.dataset_train_split)
+    train_dataset = train_dataset.filter(lambda x: len(x["filter_generations"]) > 0)
     train_dataset = train_dataset.map(make_conversation)
-    eval_dataset = eval_dataset.rename_columns(
-        {"Problem": "problem", "Solution": "solution", "Answer": "answer"}
-    )
-    eval_dataset = eval_dataset.map(make_conversation)
-    # overfit check
-    # train_dataset = eval_dataset
+
+    eval_dataset = None
+    if training_args.eval_strategy != "no":
+        eval_dataset = load_dataset("Maxwell-Jia/AIME_2024", split="train")
+        eval_dataset = eval_dataset.rename_columns({"Problem": "problem", "Solution": "solution", "Answer": "answer"})
+        eval_dataset = eval_dataset.map(make_conversation)
+
     ################
     # Load tokenizer
     ################
@@ -200,11 +192,7 @@ def main(script_args, training_args, model_args):
     reward_funcs = [REWARD_FUNCS_REGISTRY[func] for func in script_args.reward_funcs]
 
     logger.info("*** Initializing model kwargs ***")
-    torch_dtype = (
-        model_args.torch_dtype
-        if model_args.torch_dtype in ["auto", None]
-        else getattr(torch, model_args.torch_dtype)
-    )
+    torch_dtype = model_args.torch_dtype if model_args.torch_dtype in ["auto", None] else getattr(torch, model_args.torch_dtype)
     quantization_config = get_quantization_config(model_args)
     model_kwargs = dict(
         revision=model_args.model_revision,
@@ -234,15 +222,17 @@ def main(script_args, training_args, model_args):
     # Training loop
     ###############
     logger.info("*** Train ***")
-    checkpoint = None
     if training_args.resume_from_checkpoint is not None:
-        checkpoint = training_args.resume_from_checkpoint
+        trainer.model.load_adapter(
+            training_args.resume_from_checkpoint,
+            trainer.model.active_adapter,
+            is_trainable=True,
+        )
+        train_result = trainer.train()
     elif last_checkpoint is not None:
-        checkpoint = last_checkpoint
-    print("Load checkpoint manually")
-    _checkpoint = "data/Qwen-7B-Simple-RL/checkpoint-100"
-    trainer.model.load_adapter(_checkpoint, "peft", is_trainable=True)
-    train_result = trainer.train(resume_from_checkpoint=checkpoint)
+        train_result = trainer.train(resume_from_checkpoint=last_checkpoint)
+    else:
+        train_result = trainer.train()
     metrics = train_result.metrics
     metrics["train_samples"] = len(train_dataset)
     trainer.log_metrics("train", metrics)
