@@ -574,7 +574,9 @@ class FastGRPOTrainer(Trainer):
 
             iteration_losses = []
             iteration_grad_norms = []
-            for _ in range(self.num_iterations):
+            # store the per-token logps for each mini-batch
+            self._buffer = [None] * (len(gen_dataset) // self.args.per_device_train_batch_size)
+            for iteration in range(self.num_iterations):
                 mini_batch_dataloader = DataLoader(
                     gen_dataset,
                     batch_size=self.args.per_device_train_batch_size,
@@ -582,9 +584,8 @@ class FastGRPOTrainer(Trainer):
                     drop_last=True,
                     collate_fn=lambda x: mini_batch_collator(x, self.processing_class, self.args.max_prompt_length),
                 )
-                self._buffer = [None] * len(mini_batch_dataloader)  # store the per-token logps for each mini-batch
                 for idx, mini_batch in enumerate(mini_batch_dataloader):
-                    loss = self._optimization_step(mini_batch, idx)
+                    loss = self._optimization_step(mini_batch, idx, iteration + 1)
                     iteration_losses.append(loss)
                 # Add proper gradient clipping
                 _grad_norm = None
@@ -656,7 +657,7 @@ class FastGRPOTrainer(Trainer):
 
         return model
 
-    def _optimization_step(self, mini_batch: dict[str, torch.Tensor | list[str]], idx: int):
+    def _optimization_step(self, mini_batch: dict[str, torch.Tensor | list[str]], idx: int, iteration: int):
         device = self.accelerator.device
         prompts = mini_batch.pop("prompts")
         mini_batch = {k: v.to(device) for k, v in mini_batch.items()}
