@@ -116,7 +116,7 @@ def main(script_args, training_args, model_args):
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
-        level=logging.DEBUG if training_args.local_rank in [-1, 0] else logging.ERROR,
+        level=logging.INFO if training_args.local_rank in [-1, 0] else logging.ERROR,
     )
 
     # Log on each process a small summary

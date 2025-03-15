@@ -1,10 +1,13 @@
 import logging
 
+from accelerate import Accelerator
+from accelerate.utils import is_peft_model
 import deepspeed
 from deepspeed.runtime.engine import DeepSpeedEngine
 import torch
 from torch.distributed.device_mesh import DeviceMesh
 from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
+from trl.models import unwrap_model_for_generation
 from vllm import LLM
 from vllm.distributed import parallel_state as vllm_ps
 
@@ -75,14 +78,18 @@ class VLLMShardingManager:
         self,
         module: DeepSpeedEngine,
         inference_engine: LLM,
+        accelerator: Accelerator,
         model_config,
         full_params: bool = False,
         device_mesh: DeviceMesh = None,
+        load_weights: bool = True,
     ):
         self.module = module
         self.inference_engine = inference_engine
         self.model_config = model_config
         self.device_mesh = device_mesh
+        self.accelerator = accelerator
+        self.load_weights = load_weights
 
         self.tp_size = vllm_ps.get_tensor_model_parallel_world_size()
         self.tp_rank = vllm_ps.get_tensor_model_parallel_rank()
@@ -99,35 +106,55 @@ class VLLMShardingManager:
             self.gen_random_states = None
 
     def __enter__(self):
-        log_gpu_memory_usage("Before state_dict() in sharding manager memory", logger=logger)
 
-        if is_deepspeed_zero3_enabled():
-            params = {}
-            for name, param in self.module.module.named_parameters():
-                with deepspeed.zero.GatheredParameters([param]):
-                    params[name] = param.data
-                params[name] = params[name].cpu()
-        else:
-            params = self.module.state_dict()
-            params = {k: v.cpu() for k, v in params.items()}
+        state_dict = {}
+        if self.load_weights:
+            log_gpu_memory_usage("Before state_dict() in sharding manager memory", logger=logger)
+            is_peft = is_peft_model(self.module.module)
+            if is_peft:
+                with unwrap_model_for_generation(self.module, self.accelerator) as unwrapped_model:
+                    unwrapped_model.merge_adapter()
+                    state_dict = unwrapped_model.state_dict()
+                    # Remove base_model and base_layer prefixes
+                    state_dict = {k.removeprefix("base_model.model.").replace(".base_layer", ""): v for k, v in state_dict.items()}
+                    # Remove values with adapter prefix (example: "_lora")
+                    state_dict = {k: v for k, v in state_dict.items() if unwrapped_model.prefix not in k}
+                    # When module to save, remove its prefix and discard the original module
+                    state_dict = {k.replace("modules_to_save.default.", ""): v for k, v in state_dict.items() if "original_module" not in k}
 
-        torch.cuda.empty_cache()
+                    # Unmerge the adapter to restore the model to its original state.
+                    # This must be done after loading weights to ensure they correspond to the merged state.
+                    if is_peft_model(unwrapped_model):
+                        unwrapped_model.unmerge_adapter()
+                    state_dict = {k: v.cpu() for k, v in state_dict.items()}
 
-        log_gpu_memory_usage("After state_dict() in sharding manager memory", logger=logger)
+            elif is_deepspeed_zero3_enabled():
+                state_dict = {}
+                for name, param in self.module.module.named_parameters():
+                    with deepspeed.zero.GatheredParameters([param]):
+                        state_dict[name] = param.data
+                    state_dict[name] = state_dict[name].cpu()
+            else:
+                state_dict = self.module.module.state_dict()
+                state_dict = {k: v.cpu() for k, v in state_dict.items()}
+
+            torch.cuda.empty_cache()
+
+            log_gpu_memory_usage("After state_dict() in sharding manager memory", logger=logger)
 
         self.inference_engine.wake_up()
         model = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
-        # loaded_params = model.load_weights(((name, param) for name, param in params.items()))
-        loaded_params = []
-        device_id = torch.cuda.current_device()
-        for name, param in params.items():
-            param = param.to(torch.device(f"cuda:{device_id}"), non_blocking=True)
-            loaded_params.append(model.load_weights([(name, param)]))
 
-        logger.info(f"vLLM load weights, loaded_params: {len(loaded_params)}")
+        if self.load_weights:
+            loaded_params = []
+            device_id = torch.cuda.current_device()
+            for name, param in state_dict.items():
+                param = param.to(torch.device(f"cuda:{device_id}"), non_blocking=True)
+                loaded_params.append(model.load_weights([(name, param)]))
+            logger.info(f"vLLM load weights, loaded_params: {len(loaded_params)}")
 
         log_gpu_memory_usage("After sync model weights in sharding manager", logger=logger)
-        del params
+        del state_dict
         log_gpu_memory_usage("After del state_dict and empty_cache in sharding manager", logger=logger)
 
         offload_deepspeed_model_to_cpu(self.module)

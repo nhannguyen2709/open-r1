@@ -194,8 +194,9 @@ class GRPOConfig(TrainingArguments):
             # Handle nested sampling_params_dict specially
             if "sampling_params_dict" in self.vllm_config:
                 config_dict["sampling_params_dict"] = self.vllm_config["sampling_params_dict"]
-                config_dict["sampling_params_dict"]["n"] = self.num_generations
                 config_dict["sampling_params_dict"]["max_tokens"] = self.max_completion_length
+                config_dict["max_model_len"] = self.max_prompt_length + self.max_completion_length
+                config_dict["max_num_batched_tokens"] = self.max_prompt_length + self.max_completion_length
 
             # Create a new vLLMConfig with the merged values
             self.vllm_config = vLLMConfig(**config_dict)

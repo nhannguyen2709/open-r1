@@ -81,8 +81,7 @@ from trl.trainer.utils import (
 )
 
 if is_accelerate_available():
-    from accelerate import Accelerator
-    from accelerate.utils import DistributedType, gather, is_peft_model, set_seed
+    from accelerate.utils import DistributedType, is_peft_model, set_seed
     from accelerate.utils.other import is_compiled_module
 
 if is_peft_available():
@@ -92,12 +91,8 @@ if is_wandb_available():
     import wandb
 
 from open_r1.configs import GRPOConfig
-from open_r1.deepspeed_utils import (
-    offload_deepspeed_model_to_cpu,
-    load_deepspeed_model_to_gpu,
-    offload_deepspeed_optimizer,
-    load_deepspeed_optimizer,
-)
+from open_r1.deepspeed_utils import _DeepSpeedForwardRedirection
+from open_r1.grpo_loss import LigerFusedLinearGRPOLoss
 from open_r1.performance import log_gpu_memory_usage
 from open_r1.vllm_rollout import vLLMRollout, VLLMShardingManager
 
@@ -271,6 +266,11 @@ class FastGRPOTrainer(Trainer):
         self.backup_model = None
 
         # Build actor model + optimizer, reference model
+        if is_deepspeed_zero3_enabled() and peft_config is not None:
+            raise ValueError(
+                "PEFT (Parameter-Efficient Fine-Tuning) is not supported with DeepSpeed ZeRO-3. "
+                "Please disable DeepSpeed ZeRO-3 or use a different training configuration without PEFT."
+            )
         if peft_config is not None:
             model = get_peft_model(model, peft_config)
 
@@ -333,9 +333,13 @@ class FastGRPOTrainer(Trainer):
 
         log_gpu_memory_usage("Before building vllm rollout", logger=logger)
         self.rollout = vLLMRollout(model_id, self.args.vllm_config, self.processing_class)
+        logger.info(f"Sampling params: {self.args.vllm_config.sampling_params}")
         log_gpu_memory_usage("After building vllm rollout", logger=logger)
-        self.rollout_sharding_manager = VLLMShardingManager(self.model, self.rollout.inference_engine, model.config, device_mesh=rollout_device_mesh)
+        self.rollout_sharding_manager = VLLMShardingManager(
+            self.model, self.rollout.inference_engine, self.accelerator, model.config, device_mesh=rollout_device_mesh
+        )
         log_gpu_memory_usage("After building vllm sharding manager", logger=logger)
+        self._last_loaded_step = 0
         self.accelerator.wait_for_everyone()
 
         self.log_completions = args.log_completions
@@ -355,35 +359,6 @@ class FastGRPOTrainer(Trainer):
         # See https://github.com/huggingface/trl/issues/2770
         logits = logits[:, -logits_to_keep:]
         return selective_log_softmax(logits, input_ids)  #  compute logprobs for the input tokens
-
-    @profiling_decorator
-    @torch.no_grad()
-    def _move_model_to_vllm(self):
-        with unwrap_model_for_generation(
-            self.model,
-            self.accelerator,
-            gather_deepspeed3_params=self.args.ds3_gather_for_generation,
-        ) as unwrapped_model:
-            if is_compiled_module(unwrapped_model):
-                unwrapped_model = unwrapped_model._orig_mod
-            if is_peft_model(unwrapped_model):
-                unwrapped_model.merge_adapter()
-                state_dict = unwrapped_model.state_dict()
-                # Remove base_model and base_layer prefixes
-                state_dict = {k.removeprefix("base_model.model.").replace(".base_layer", ""): v for k, v in state_dict.items()}
-                # Remove values with adapter prefix (example: "_lora")
-                state_dict = {k: v for k, v in state_dict.items() if unwrapped_model.prefix not in k}
-                # When module to save, remove its prefix and discard the original module
-                state_dict = {k.replace("modules_to_save.default.", ""): v for k, v in state_dict.items() if "original_module" not in k}
-            else:
-                state_dict = unwrapped_model.state_dict()
-
-            llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
-            llm_model.load_weights(state_dict.items())
-            # Unmerge the adapter to restore the model to its original state.
-            # This must be done after loading weights to ensure they correspond to the merged state.
-            if is_peft_model(unwrapped_model):
-                unwrapped_model.unmerge_adapter()
 
     @torch.no_grad()
     def prepare_batch(self, batch):
@@ -405,6 +380,9 @@ class FastGRPOTrainer(Trainer):
         for prompt in prompts_text:
             all_prompts_text.extend([prompt] * self.args.num_generations)
 
+        load_weights = self.state.global_step != self._last_loaded_step
+        self.rollout_sharding_manager.load_weights = load_weights
+        start = time.time()
         with self.rollout_sharding_manager:
             log_gpu_memory_usage("After entering rollout sharding manager", logger=logger)
 
@@ -412,8 +390,10 @@ class FastGRPOTrainer(Trainer):
             completion_ids = self.rollout.generate_sequences(all_prompts_text)
 
             log_gpu_memory_usage("After rollout generation", logger=logger)
+            logger.info(f"Rollout generation time: {time.time() - start:.2f}s")
 
             completion_ids = self.rollout_sharding_manager.postprocess_data(completion_ids)
+        self._last_loaded_step = self.state.global_step
 
         # Decode the generated completions
         repeated_prompts = []
@@ -688,31 +668,86 @@ class FastGRPOTrainer(Trainer):
                         logits_to_keep,
                     )
 
-        with self.accelerator.accumulate(self.model):
-            per_token_logps = self._get_per_token_logps(
-                self.model,
-                input_ids,
-                attention_mask,
-                logits_to_keep,
+        grpo_loss_fn = LigerFusedLinearGRPOLoss(beta=self.args.beta, epsilon=self.args.epsilon, compiled=False)
+
+        def grpo_partial(last_hidden_state, lm_head, input_ids, attention_mask, advantages, ref_per_token_logps, old_per_token_logps):
+            return grpo_loss_fn(
+                last_hidden_state, lm_head.weight, input_ids, attention_mask, advantages, ref_per_token_logps, old_per_token_logps, lm_head.bias
             )
-            per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
+
+        with self.accelerator.accumulate(self.model):
             old_per_token_logps = self._buffer[idx]
-            if old_per_token_logps is None:
-                old_per_token_logps = per_token_logps.detach()
-            self._buffer[idx] = per_token_logps.detach()
-            coef_1 = torch.exp(per_token_logps - old_per_token_logps)
-            coef_2 = torch.clamp(coef_1, 1 - self.args.epsilon, 1 + self.args.epsilon)
-            per_token_loss1 = coef_1 * advantages
-            per_token_loss2 = coef_2 * advantages
-            per_token_loss = torch.min(per_token_loss1, per_token_loss2)
-            per_token_loss = -(per_token_loss - self.args.beta * per_token_kl)
-            loss = (per_token_loss * completion_mask).sum() / completion_mask.sum()
+            if is_deepspeed_zero3_enabled():
+                outputs = _DeepSpeedForwardRedirection()(
+                    self.model, self.model.module.model, input_ids, attention_mask=attention_mask, use_cache=False
+                )
+            else:
+                if is_peft_model(self.model.module):
+                    outputs = self.model.module.model.model(input_ids, attention_mask=attention_mask, use_cache=False)
+                else:
+                    outputs = self.model.module.model(input_ids, attention_mask=attention_mask, use_cache=False)
+            last_hidden_state = outputs.last_hidden_state
+            last_hidden_state = last_hidden_state[:, :-1][:, -logits_to_keep:]
+            # Flattening tensors to pass to the GRPO loss function
+            last_hidden_state = last_hidden_state.flatten(0, 1)
+            input_ids = input_ids[:, -logits_to_keep:].flatten()
+            attention_mask = attention_mask[:, -logits_to_keep:].flatten()
+            advantages = advantages.repeat_interleave(logits_to_keep, dim=1).flatten()
+            ref_per_token_logps = ref_per_token_logps.flatten()
+            if old_per_token_logps is not None:
+                old_per_token_logps = old_per_token_logps.flatten()
+
+            if is_deepspeed_zero3_enabled():
+                loss, (per_token_logps, mean_kl, clip_ratio) = _DeepSpeedForwardRedirection()(
+                    self.model,
+                    grpo_partial,
+                    last_hidden_state,
+                    self.model.module.lm_head,
+                    input_ids,
+                    attention_mask,
+                    advantages,
+                    ref_per_token_logps,
+                    old_per_token_logps,
+                )
+            else:
+                loss, (per_token_logps, mean_kl, clip_ratio) = grpo_partial(
+                    last_hidden_state,
+                    self.model.module.lm_head,
+                    input_ids,
+                    attention_mask,
+                    advantages,
+                    ref_per_token_logps,
+                    old_per_token_logps,
+                )
+            self._buffer[idx] = per_token_logps.reshape(completion_ids.size())  # reshaped to match the completion_ids shape
+            # per_token_logps = self._get_per_token_logps(
+            #     self.model,
+            #     input_ids,
+            #     attention_mask,
+            #     logits_to_keep,
+            # )
+            # per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
+            # if old_per_token_logps is None:
+            #     old_per_token_logps = per_token_logps.detach()
+            # self._buffer[idx] = per_token_logps.detach()
+            # coef_1 = torch.exp(per_token_logps - old_per_token_logps)
+            # coef_2 = torch.clamp(coef_1, 1 - self.args.epsilon, 1 + self.args.epsilon)
+            # per_token_loss1 = coef_1 * advantages
+            # per_token_loss2 = coef_2 * advantages
+            # per_token_loss = torch.min(per_token_loss1, per_token_loss2)
+            # per_token_loss = -(per_token_loss - self.args.beta * per_token_kl)
+            # loss = (per_token_loss * completion_mask).sum() / completion_mask.sum()
+            # is_clipped = (per_token_loss1 < per_token_loss2).float()
+            # clip_ratio = (is_clipped * completion_mask).sum() / completion_mask.sum()
+            # mean_kl = (per_token_kl * completion_mask).sum() / completion_mask.sum()
+
             self.accelerator.backward(loss)
             # Run callbacks and optimizer steps
             self.control = self.callback_handler.on_pre_optimizer_step(self.args, self.state, self.control)
             self.optimizer.step()
             self.control = self.callback_handler.on_optimizer_step(self.args, self.state, self.control)
             self.optimizer.zero_grad()
+
         # Log the metrics
         with torch.no_grad():
             completion_length = self.accelerator.gather_for_metrics(completion_mask.sum(1)).float().mean().item()
@@ -732,10 +767,7 @@ class FastGRPOTrainer(Trainer):
             rewards = rewards.sum(dim=1)
             self._metrics["train"]["rewards"].append(rewards.mean().item())
             self._metrics["train"]["rewards_std"].append(rewards.std().item())
-            is_clipped = (per_token_loss1 < per_token_loss2).float()
-            clip_ratio = (is_clipped * completion_mask).sum() / completion_mask.sum()
             self._metrics["train"]["clip_ratio"].append(self.accelerator.gather_for_metrics(clip_ratio).mean().item())
-            mean_kl = (per_token_kl * completion_mask).sum() / completion_mask.sum()
             self._metrics["train"]["kl"].append(self.accelerator.gather_for_metrics(mean_kl).mean().item())
 
         return loss.detach()
