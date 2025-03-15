@@ -1,6 +1,6 @@
 # Model arguments
-model_name_or_path: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
-output_dir: data/Qwen-7B-GRPO-v2
+model_name_or_path: deepseek-ai/DeepSeek-R1-Distill-Qwen-14B
+output_dir: data/Qwen-14B-GRPO-v0
 model_revision: main
 torch_dtype: bfloat16
 attn_implementation: flash_attention_2
@@ -20,7 +20,7 @@ system_prompt: "You are a helpful AI Assistant, designed to provided well-reason
 # LORA config
 use_peft: true
 lora_task_type: CAUSAL_LM
-lora_r: 256
+lora_r: 64
 lora_alpha: 16
 lora_dropout: 0.05
 lora_target_modules:
@@ -34,34 +34,39 @@ lora_target_modules:
 
 warmup_ratio: 0.05
 gradient_accumulation_steps: 8
-learning_rate: 4.0e-5
+learning_rate: 2.0e-5
 lr_scheduler_type: cosine_with_min_lr
 lr_scheduler_kwargs:
   min_lr_rate: 0.1
-num_iterations: 4
-num_generations: 4
+num_iterations: 2
+num_generations: 8
 max_prompt_length: 512
-max_completion_length: 8192
+max_completion_length: 12288
 per_device_eval_batch_size: 4
 per_device_train_batch_size: 4
 
 # GRPO trainer config
-temperature: 0.6
-bf16: true
-vllm_gpu_memory_utilization: 0.6
-vllm_tensor_parallel_size: 2
+vllm_config:
+  enforce_eager: true
+  gpu_memory_utilization: 0.5
+  tensor_parallel_size: 2
+  disable_log_stats: true
+  sampling_params_dict:
+    temperature: 0.6
+    top_p: 0.95
+    repetition_penalty: 1.05
+    min_p: 0.05
 
+bf16: true
 num_train_epochs: 2
 
 do_eval: true
-eval_strategy: steps
-eval_steps: 50
 
 save_strategy: steps
-save_steps: 50
-save_total_limit: 2
+save_steps: 5
+save_total_limit: 1
 
-log_level: info
+log_level: error
 logging_strategy: steps
 logging_steps: 1
 
