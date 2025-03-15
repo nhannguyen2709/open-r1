@@ -21,12 +21,11 @@ import math
 from packaging import version
 import os
 import time
-from typing import Any, Callable, Optional, Union
+from typing import Callable, Optional, Union
 
 from datasets import Dataset, IterableDataset
-import deepspeed
 import torch
-from torch.distributed.distributed_c10d import ProcessGroup
+from torch.distributed.device_mesh import init_device_mesh
 from torch.utils.data import DataLoader
 
 import transformers
@@ -68,7 +67,6 @@ from trl.data_utils import (
 )
 
 from trl.extras.profiling import profiling_decorator
-from trl.import_utils import is_vllm_available
 from trl.models import (
     create_reference_model,
     prepare_deepspeed,
@@ -93,27 +91,19 @@ if is_peft_available():
 if is_wandb_available():
     import wandb
 
-if is_vllm_available():
-    import vllm
-    from vllm import LLM, SamplingParams
-    from vllm.distributed.parallel_state import (
-        get_tensor_model_parallel_rank,
-        get_tensor_model_parallel_world_size,
-        get_tp_group,
-    )
-    from vllm.sampling_params import GuidedDecodingParams
-
 from open_r1.configs import GRPOConfig
+from open_r1.deepspeed_utils import (
+    offload_deepspeed_model_to_cpu,
+    load_deepspeed_model_to_gpu,
+    offload_deepspeed_optimizer,
+    load_deepspeed_optimizer,
+)
+from open_r1.performance import log_gpu_memory_usage
+from open_r1.vllm_rollout import vLLMRollout, VLLMShardingManager
 
 
 RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
 logger = logging.getLogger(__name__)
-
-
-def barrier():
-    if torch.distributed.is_initialized():
-        torch.distributed.barrier()
-        torch.cuda.synchronize()
 
 
 def exact_div(a: int, b: int, custom_error_message: str = "") -> int:
@@ -121,13 +111,6 @@ def exact_div(a: int, b: int, custom_error_message: str = "") -> int:
     if a != q * b:
         raise ValueError(f"{custom_error_message}, inexact division: {a} / {b} = {a / b}")
     return q
-
-
-def gather_object(object: Any, group_size: int, group: ProcessGroup):
-    output_objects = [None for _ in range(group_size)]
-    torch.distributed.all_gather_object(output_objects, object, group=group)
-    # all_gather_object returns a list of lists, so we need to flatten it
-    return [x for y in output_objects for x in y]
 
 
 class FastGRPOTrainer(Trainer):
@@ -189,46 +172,6 @@ class FastGRPOTrainer(Trainer):
         if args.gradient_checkpointing:
             model = self._enable_gradient_checkpointing(model, args)
 
-        if peft_config is not None:
-            if not is_peft_available():
-                raise ImportError("PEFT is required to use `peft_config`. Run `pip install peft`.")
-            model = get_peft_model(model, peft_config)
-        self.model = model
-
-        # Reference model
-        self.beta = args.beta
-        if self.beta == 0.0:
-            # If beta is 0.0, the reference model is not needed
-            self.ref_model = None
-        elif is_deepspeed_zero3_enabled():
-            self.ref_model = AutoModelForCausalLM.from_pretrained(model_id, **model_init_kwargs)
-        elif is_peft_model(model):
-            # If PEFT is used, the reference model is not needed since the adapter can be disabled
-            # to revert to the initial model.
-            self.ref_model = None
-        else:
-            # If PEFT configuration is not provided, create a reference model based on the initial model.
-            self.ref_model = create_reference_model(model)
-
-        if self.args.use_liger_kernel:
-            if is_liger_kernel_available():
-                from liger_kernel.transformers import _apply_liger_kernel_to_instance
-
-                if isinstance(self.model, PreTrainedModel):
-                    _apply_liger_kernel_to_instance(model=self.model)
-                elif isinstance(self.model, PeftModel):
-                    _apply_liger_kernel_to_instance(model=self.model.base_model.model)
-                else:
-                    logger.warning("The model is not an instance of PreTrainedModel. No liger kernels will be applied.")
-
-                if self.ref_model is not None:
-                    _apply_liger_kernel_to_instance(model=self.ref_model)
-            else:
-                raise ImportError(
-                    "You have set `use_liger_kernel` to `True` but liger-kernel >= 0.3.0 is not available. "
-                    "Please install it with `pip install liger-kernel`"
-                )
-
         # Processing class
         if processing_class is None:
             processing_class = AutoTokenizer.from_pretrained(model.config._name_or_path, padding_side="left")
@@ -286,6 +229,7 @@ class FastGRPOTrainer(Trainer):
         self.use_vllm = args.use_vllm
 
         # Multi-step
+        self.beta = args.beta
         self.num_iterations = args.num_iterations  # = 𝜇 in the GRPO paper
         self.epsilon = args.epsilon
         # Tracks the number of iterations (forward + backward passes), including those within a gradient accumulation cycle.
@@ -298,9 +242,6 @@ class FastGRPOTrainer(Trainer):
         )
         self.optimizer, self.lr_scheduler = optimizers
         self.optimizer_cls_and_kwargs = None  # needed for transformers >= 4.47
-        # self.accelerator = Accelerator(
-        #     gradient_accumulation_steps=args.gradient_accumulation_steps
-        # )
         self.create_accelerator_and_postprocess()
 
         set_seed(args.seed, device_specific=True)
@@ -314,31 +255,13 @@ class FastGRPOTrainer(Trainer):
         self.train_dataset_len = len(self.train_dataset)
         num_total_samples = int(self.args.num_train_epochs * self.train_dataset_len)
         self.total_steps_per_device = num_total_samples // (self.local_dataloader_batch_size * self.accelerator.num_processes)
-        self.create_optimizer_and_scheduler(num_training_steps=self.total_steps_per_device)
-        #########
-        ### trainer specifics
-        #########
+
         default_callbacks = DEFAULT_CALLBACKS + get_reporting_integration_callbacks(self.args.report_to)
         self.callbacks = default_callbacks if callbacks is None else default_callbacks + callbacks
-        self.callback_handler = CallbackHandler(
-            self.callbacks,
-            self.model,
-            self.processing_class,
-            self.optimizer,
-            self.lr_scheduler,
-        )
-        self.add_callback(PrinterCallback if self.args.disable_tqdm else DEFAULT_PROGRESS_CALLBACK)
-        self.control = TrainerControl()
-        self.state = TrainerState(
-            is_local_process_zero=self.is_local_process_zero(),
-            is_world_process_zero=self.is_world_process_zero(),
-            stateful_callbacks=[cb for cb in self.callback_handler.callbacks + [self.control] if isinstance(cb, ExportableState)],
-        )
-
-        self.current_flos = 0
-        self.hp_search_backend = None
         self.is_deepspeed_enabled = getattr(self.accelerator.state, "deepspeed_plugin", None) is not None
         self.is_fsdp_enabled = getattr(self.accelerator.state, "fsdp_plugin", None) is not None
+        self.current_flos = 0
+        self.hp_search_backend = None
         # Create distant repo and output directory if needed
         self.hub_model_id = None
         if self.args.push_to_hub:
@@ -347,35 +270,73 @@ class FastGRPOTrainer(Trainer):
             os.makedirs(self.args.output_dir, exist_ok=True)
         self.backup_model = None
 
+        # Build actor model + optimizer, reference model
+        if peft_config is not None:
+            model = get_peft_model(model, peft_config)
+
+        self.model = model
+
+        if self.beta == 0.0:
+            # If beta is 0.0, the reference model is not needed
+            self.ref_model = None
+        elif is_deepspeed_zero3_enabled():
+            self.ref_model = AutoModelForCausalLM.from_pretrained(model_id, **model_init_kwargs)
+        elif is_peft_model(model):
+            # If PEFT is used, the reference model is not needed since the adapter can be disabled
+            # to revert to the initial model.
+            self.ref_model = None
+        else:
+            # If PEFT configuration is not provided, create a reference model based on the initial model.
+            self.ref_model = create_reference_model(model)
+
+        if self.args.use_liger_kernel:
+            if is_liger_kernel_available():
+                from liger_kernel.transformers import _apply_liger_kernel_to_instance
+
+                if isinstance(self.model, PreTrainedModel):
+                    _apply_liger_kernel_to_instance(model=self.model)
+                elif isinstance(self.model, PeftModel):
+                    _apply_liger_kernel_to_instance(model=self.model.base_model.model)
+                else:
+                    logger.warning("The model is not an instance of PreTrainedModel. No liger kernels will be applied.")
+
+                if self.ref_model is not None:
+                    _apply_liger_kernel_to_instance(model=self.ref_model)
+            else:
+                raise ImportError(
+                    "You have set `use_liger_kernel` to `True` but liger-kernel >= 0.3.0 is not available. "
+                    "Please install it with `pip install liger-kernel`"
+                )
         # Add tags for models that have been loaded with the correct transformers version
         if hasattr(self.model, "add_model_tags"):
             self.model.add_model_tags(self._tag_names)
 
+        # Accelerator prepare
+        self.create_optimizer_and_scheduler(num_training_steps=self.total_steps_per_device)
         self.model, self.optimizer, self.dataloader = self.accelerator.prepare(self.model, self.optimizer, self.dataloader)
-        offload_states(self.model, self.optimizer)
         if self.ref_model is not None:
             if self.is_deepspeed_enabled:
                 self.ref_model = prepare_deepspeed(self.ref_model, self.accelerator)
             else:
                 self.ref_model = self.accelerator.prepare_model(self.ref_model, evaluation_mode=True)
-            offload_states(self.ref_model, None)
 
-        self.llm = LLM(
-            model=model.name_or_path,
-            gpu_memory_utilization=self.args.vllm_gpu_memory_utilization,
-            dtype=self.args.vllm_dtype,
-            enable_prefix_caching=False,
-            max_model_len=self.args.vllm_max_model_len,
-            enforce_eager=self.args.vllm_enforce_eager,
-            tensor_parallel_size=self.args.vllm_tensor_parallel_size,
-            distributed_executor_backend=("external_launcher" if torch.distributed.is_initialized() else None),
-            enable_sleep_mode=True,
-        )
-        self.sampling_params = SamplingParams(
-            temperature=args.temperature,
-            max_tokens=self.args.max_completion_length,
-            n=args.num_generations,
-        )
+        # Build vllm rollout
+        infer_tp = self.args.vllm_config.tensor_parallel_size
+        dp = self.accelerator.num_processes // infer_tp
+        assert (
+            self.accelerator.num_processes % infer_tp == 0
+        ), f"rollout world_size: {self.accelerator.num_processes} is not divisible by infer_tp: {infer_tp}"
+        if dp > 1:
+            rollout_device_mesh = init_device_mesh("cuda", mesh_shape=(dp, infer_tp), mesh_dim_names=["dp", "infer_tp"])
+        else:
+            rollout_device_mesh = None
+
+        log_gpu_memory_usage("Before building vllm rollout", logger=logger)
+        self.rollout = vLLMRollout(model_id, self.args.vllm_config, self.processing_class)
+        log_gpu_memory_usage("After building vllm rollout", logger=logger)
+        self.rollout_sharding_manager = VLLMShardingManager(self.model, self.rollout.inference_engine, model.config, device_mesh=rollout_device_mesh)
+        log_gpu_memory_usage("After building vllm sharding manager", logger=logger)
+        self.accelerator.wait_for_everyone()
 
         self.log_completions = args.log_completions
 
@@ -398,22 +359,6 @@ class FastGRPOTrainer(Trainer):
     @profiling_decorator
     @torch.no_grad()
     def _move_model_to_vllm(self):
-        torch.cuda.empty_cache()
-        # gather_deepspeed3_params = self.args.ds3_gather_for_generation
-
-        # unwrapped_model = self.accelerator.unwrap_model(self.model)
-        # if is_compiled_module(unwrapped_model):
-        #     unwrapped_model = unwrapped_model._orig_mod
-
-        # llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
-
-        # for name, param in unwrapped_model.named_parameters():
-        # with deepspeed.zero.GatheredParameters([param], enabled=gather_deepspeed3_params):
-        #     llm_model.load_weights(weights=[(name, param.data)])
-
-        # from peft.tuners.tuners_utils import onload_layer
-        # from peft.utils import _get_submodules
-
         with unwrap_model_for_generation(
             self.model,
             self.accelerator,
@@ -432,21 +377,13 @@ class FastGRPOTrainer(Trainer):
                 state_dict = {k.replace("modules_to_save.default.", ""): v for k, v in state_dict.items() if "original_module" not in k}
             else:
                 state_dict = unwrapped_model.state_dict()
+
+            llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
+            llm_model.load_weights(state_dict.items())
             # Unmerge the adapter to restore the model to its original state.
             # This must be done after loading weights to ensure they correspond to the merged state.
             if is_peft_model(unwrapped_model):
                 unwrapped_model.unmerge_adapter()
-
-        # del unwrapped_model
-        state_dict = {k: v.cpu() for k, v in state_dict.items()}
-        gc.collect()
-        torch.cuda.empty_cache()
-        offload_states(self.model, self.optimizer)
-        offload_states(self.ref_model, None)
-        self.llm.wake_up()
-        llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
-        llm_model.load_weights(state_dict.items())
-        self.accelerator.wait_for_everyone()
 
     @torch.no_grad()
     def prepare_batch(self, batch):
@@ -464,35 +401,25 @@ class FastGRPOTrainer(Trainer):
             prompt_inputs["attention_mask"],
         )
 
-        if torch.distributed.is_initialized():
-            # Gather all prompts within the tensor parallel group
-            tp_world_size = get_tensor_model_parallel_world_size()
-            tp_group = get_tp_group()
-            tp_rank = get_tensor_model_parallel_rank()
-            all_prompts_text = gather_object(
-                prompts_text,
-                tp_world_size,
-                tp_group.device_group,
-            )
-            all_outputs = self.llm.generate(all_prompts_text, sampling_params=self.sampling_params, use_tqdm=False)
-            # Obtain the correct rank completions
-            all_outputs = all_outputs[tp_rank * len(prompts) : (tp_rank + 1) * len(prompts)]
-        else:
-            all_outputs = self.llm.generate(prompts_text, sampling_params=self.sampling_params, use_tqdm=False)
+        all_prompts_text = []
+        for prompt in prompts_text:
+            all_prompts_text.extend([prompt] * self.args.num_generations)
 
-        self.llm.sleep()
-        barrier()
+        with self.rollout_sharding_manager:
+            log_gpu_memory_usage("After entering rollout sharding manager", logger=logger)
 
-        completion_ids = []
-        for outputs in all_outputs:
-            for output in outputs.outputs:
-                completion_ids.append(output.token_ids)
+            all_prompts_text = self.rollout_sharding_manager.preprocess_data(all_prompts_text)
+            completion_ids = self.rollout.generate_sequences(all_prompts_text)
+
+            log_gpu_memory_usage("After rollout generation", logger=logger)
+
+            completion_ids = self.rollout_sharding_manager.postprocess_data(completion_ids)
 
         # Decode the generated completions
-        completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
         repeated_prompts = []
         for prompt in prompts:
             repeated_prompts.extend([prompt] * self.args.num_generations)
+        completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
         if is_conversational(batch[0]):
             completions = []
             for prompt, completion in zip(repeated_prompts, completions_text):
@@ -544,6 +471,21 @@ class FastGRPOTrainer(Trainer):
         self,
         resume_from_checkpoint: Optional[Union[str, bool]] = None,
     ):
+        self.callback_handler = CallbackHandler(
+            self.callbacks,
+            self.model,
+            self.processing_class,
+            self.optimizer,
+            self.lr_scheduler,
+        )
+        self.add_callback(PrinterCallback if self.args.disable_tqdm else DEFAULT_PROGRESS_CALLBACK)
+        self.control = TrainerControl()
+        self.state = TrainerState(
+            is_local_process_zero=self.is_local_process_zero(),
+            is_world_process_zero=self.is_world_process_zero(),
+            stateful_callbacks=[cb for cb in self.callback_handler.callbacks + [self.control] if isinstance(cb, ExportableState)],
+        )
+
         if self.args.logging_steps is not None:
             if self.args.logging_steps < 1:
                 self.state.logging_steps = math.ceil(self.state.max_steps * self.args.logging_steps)
@@ -560,6 +502,7 @@ class FastGRPOTrainer(Trainer):
         self.state.num_train_epochs = self.args.num_train_epochs
 
         self.model.train()
+        self.deepspeed = self.model_wrapped = self.model
 
         # ckpt loading
         if resume_from_checkpoint is not None:
@@ -625,15 +568,9 @@ class FastGRPOTrainer(Trainer):
         self.control = self.callback_handler.on_train_begin(self.args, self.state, self.control)
 
         for step in range(start_step, self.total_steps_per_device + 1):
-            if step > start_step:
-                self._move_model_to_vllm()
-
             batch = next(iter_dataloader)
             batch = self.prepare_batch(batch)
             gen_dataset = Dataset.from_list(batch)
-
-            reload_states(self.model, self.optimizer, self.accelerator.device)
-            reload_states(self.ref_model, None, self.accelerator.device)
 
             iteration_losses = []
             iteration_grad_norms = []
@@ -662,7 +599,7 @@ class FastGRPOTrainer(Trainer):
                     if hasattr(grad_norm, "item"):
                         grad_norm = grad_norm.item()
                 else:
-                    grad_norm = _grad_norm
+                    grad_norm = _grad_norm.item()
                 iteration_grad_norms.append(grad_norm)
                 num_updates += 1
 
@@ -857,67 +794,3 @@ def mini_batch_collator(examples, processing_class, max_prompt_length):
         "rewards": torch.tensor(rewards),
         "prompts": prompts,
     }
-
-
-@torch.no_grad()
-def offload_states(model, optimizer, non_blocking: bool = True):
-    """
-    Offload policy model and optimizer states to CPU.
-    """
-    if is_deepspeed_zero3_enabled():
-        adam_offload = model.config["zero_optimization"]["offload_optimizer"]["device"] == "cpu"
-
-        # state offloading not required when using Adam optimizer offloading
-        if adam_offload:
-            return
-
-        # if zero_stage == 3 and not adam_offload:
-        import torch
-        from deepspeed.runtime.zero.offload_config import OffloadDeviceEnum, OffloadStateTypeEnum
-
-        model.optimizer.offload_states(
-            include=[
-                OffloadStateTypeEnum.optim_states,
-                OffloadStateTypeEnum.contiguous_grad_buffer,
-                OffloadStateTypeEnum.hp_params,
-                # OffloadStateTypeEnum.lp_grads,
-                # OffloadStateTypeEnum.lp_params, # Not released yet, fixed in https://github.com/deepspeedai/DeepSpeed/pull/7050
-            ],
-            device=OffloadDeviceEnum.cpu,
-            non_blocking=non_blocking,
-        )
-        model.empty_partition_cache()
-
-    else:
-        model.to("cpu", non_blocking=non_blocking)
-        if optimizer is not None:
-            for param_group in optimizer.param_groups:
-                for param in param_group["params"]:
-                    param.data = param.data.to("cpu", non_blocking=non_blocking)
-
-    torch.cuda.empty_cache()
-    torch.distributed.barrier()
-    torch.cuda.synchronize()
-
-
-@torch.no_grad()
-def reload_states(model, optimizer, device, non_blocking: bool = True):
-    """
-    Reload policy model and optimizer states back to GPU.
-    This is called after vLLM generation is complete and we need to resume policy training.
-    """
-    if is_deepspeed_zero3_enabled():
-        adam_offload = model.config["zero_optimization"]["offload_optimizer"]["device"] == "cpu"
-        if adam_offload:
-            return
-        model.reload_states(non_blocking=non_blocking)
-    else:
-        model.to(device, non_blocking=non_blocking)
-        if optimizer is not None:
-            for param_group in optimizer.param_groups:
-                for param in param_group["params"]:
-                    param.data = param.data.to(device, non_blocking=non_blocking)
-
-    torch.cuda.empty_cache()
-    torch.distributed.barrier()
-    torch.cuda.synchronize()

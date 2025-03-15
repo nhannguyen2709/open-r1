@@ -1,3 +1,4 @@
+import argparse
 import os
 import gc
 import time
@@ -12,6 +13,12 @@ import random
 from vllm import LLM, SamplingParams
 from transformers import PreTrainedTokenizer
 from datasets import load_dataset
+
+from open_r1.rewards import answer_parser
+from sympy import simplify
+import sys
+
+sys.set_int_max_str_digits(1000000)
 
 
 def create_starter_messages(question: str) -> list[dict]:
@@ -29,14 +36,24 @@ def create_starter_messages(question: str) -> list[dict]:
 
 
 def extract_boxed_text(text):
-    pattern = r"oxed{(.*?)}"
-    matches = re.findall(pattern, text)
-    if not matches:
+    # pattern = r"oxed{(.*?)}"
+    # matches = re.findall(pattern, text)
+    # if not matches:
+    #     return ""
+    # for match in matches[::-1]:
+    #     if match != "":
+    #         return match
+    # return ""
+    parsed = answer_parser(text)
+    try:
+        parsed = simplify(parsed[0])
+        parsed = int(parsed)
+        if parsed > 1e6:
+            return ""
+        else:
+            return parsed
+    except:
         return ""
-    for match in matches[::-1]:
-        if match != "":
-            return match
-    return ""
 
 
 def select_answer(answers: list[str]) -> int:
@@ -109,7 +126,7 @@ def predict_for_question(
     ground_truth: int,
     MAX_NUM_SEQS: int,
     MAX_MODEL_LEN: int,
-) -> int:
+) -> tuple[int, list[str]]:
     num_seqs = MAX_NUM_SEQS
     max_tokens = MAX_MODEL_LEN
 
@@ -127,20 +144,19 @@ def predict_for_question(
     )
     list_of_messages = generate_responses(llm, tokenizer, question, sampling_params)
     all_extracted_answers = []
-    list_of_messages_to_retry = []
+    predictions = []
     for messages in list_of_messages:
         answer = extract_boxed_text(messages[-1]["content"])
         if answer:
             all_extracted_answers.append(answer)
-        else:
-            list_of_messages_to_retry.append(messages)
+            predictions.append(messages[-1]["content"])
 
     print("Candidates: ", all_extracted_answers)
     answer = select_answer(all_extracted_answers)
     print(f"Final answer: {answer} - Ground truth: {ground_truth}")
 
     cutoff_times.pop()
-    return answer
+    return answer, predictions
 
 
 # Replace this function with your inference code.
@@ -157,7 +173,7 @@ def predict(
     MAX_MODEL_LEN,
 ):
     print(f"ID: {id_} | Question: {question}")
-    answer = predict_for_question(
+    answer, predictions = predict_for_question(
         llm,
         tokenizer,
         cutoff_times,
@@ -167,7 +183,7 @@ def predict(
         MAX_MODEL_LEN,
     )
     print("=" * 80)
-    return answer
+    return answer, predictions
 
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -187,10 +203,16 @@ cutoff_time = start_time + (4 * 60 + 45) * 60
 cutoff_times = [int(x) for x in np.linspace(cutoff_time, start_time + 180 * 60, 50 + 1)]
 warnings.simplefilter("ignore")
 
-llm_model_pth = "/mnt/weka/llm/nhan/Qwen-7B-Simple-RL-v3/checkpoint-150"
+llm_model_pth = "/mnt/weka/llm/nhan/Qwen-7B-Simple-RL-v4/checkpoint-500"
+# df = pd.read_csv("/home/andy/open-r1/reference.csv")
+# output_file = "/home/andy/open-r1/generation/reference-checkpoint-500-12seqs-12ktokens-0.6temp.csv"
+df = pd.read_csv("/home/andy/open-r1/aime-2025.csv")
+output_file = "/home/andy/open-r1/generation/aime-2025-checkpoint-500-16seqs-15ktokens-0.6temp.csv"
+df = df.rename(columns={"problem": "question"})
+# df["answer"] = df["answer"].astype(int)
 
-MAX_NUM_SEQS = 8
-MAX_MODEL_LEN = 12288  # 8192
+MAX_NUM_SEQS = 16
+MAX_MODEL_LEN = 15360
 
 llm = LLM(
     llm_model_pth,
@@ -208,26 +230,12 @@ llm = LLM(
 
 tokenizer = llm.get_tokenizer()
 
-# Load dataset from HuggingFace
-dataset = load_dataset("Maxwell-Jia/AIME_2024", split="train")
-
-# Convert to DataFrame
-df = pd.DataFrame(
-    {
-        "id": dataset["ID"],
-        "question": dataset["Problem"],
-        "answer": dataset["Answer"],
-    }
-)
-
-# df = pd.read_parquet("/home/andy/data/aime-2022-2025.parquet")
-# df = df.iloc[-60:]
-
 # Process each row
 results = []
+predictions_list = []
 for i in range(len(df)):
     row = df.iloc[i]
-    result = predict(
+    result, predictions = predict(
         llm,
         tokenizer,
         cutoff_times,
@@ -238,9 +246,12 @@ for i in range(len(df)):
         MAX_MODEL_LEN,
     )
     results.append(result)
+    predictions_list.append(predictions)
 df["prediction"] = results
+df["generations"] = predictions_list
 # Calculate accuracy
 df["correct"] = df["prediction"] == df["answer"]
 accuracy = df["correct"].mean()
 print(f"Accuracy: {accuracy:.4f}")
 print(f"Time taken: {time.time() - start_time:.2f} seconds")
+df.to_csv(output_file, index=False)

@@ -15,7 +15,8 @@ class LigerFusedLinearRLHFBase(torch.autograd.Function):
         advantages,
         bias=None,
         loss_fn=None,
-        beta=0.1,
+        beta=0.04,
+        epsilon=0.2,
         compiled=True,
         ref_inputs=None,
         ref_weight=None,
@@ -37,6 +38,7 @@ class LigerFusedLinearRLHFBase(torch.autograd.Function):
         compute_loss = partial(
             LigerFusedLinearRLHFBase._compute_chunk_loss,
             beta=beta,
+            epsilon=epsilon,
             ref_weight=ref_weight,
             ref_bias=ref_bias,
             rlhf_loss_fn=loss_fn,
@@ -166,6 +168,9 @@ class LigerFusedLinearRLHFBase(torch.autograd.Function):
 
         # Finalize metrics
         final_metrics = []
+        import pdb
+
+        pdb.set_trace()
         for metric in aggregated_metrics:
             if isinstance(metric, list):
                 final_metrics.append(torch.cat(metric, dim=0))
@@ -184,6 +189,7 @@ class LigerFusedLinearRLHFBase(torch.autograd.Function):
         ref_inputs_chunk=None,
         bias=None,
         beta=0.04,
+        epsilon=0.2,
         ref_weight=None,
         ref_bias=None,
         rlhf_loss_fn=None,
@@ -208,6 +214,7 @@ class LigerFusedLinearRLHFBase(torch.autograd.Function):
             advantages=advantages_chunk,
             ref_logits=ref_logits,
             beta=beta,
+            epsilon=epsilon,
         )
 
         return chunk_loss, (logits_mean, *chunk_metrics)
@@ -235,6 +242,7 @@ class LigerFusedLinearRLHFBase(torch.autograd.Function):
             grad_bias,
             None,  # grad_loss_fn
             None,  # grad_beta
+            None,  # grad_epsilon
             None,  # grad_compiled
             None,  # grad_ref_input
             None,  # grad_ref_weight
