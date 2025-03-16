@@ -1,6 +1,7 @@
 """Reward functions for GRPO training."""
 
 from functools import partial
+import json
 import math
 import re
 from typing import Dict
@@ -37,9 +38,7 @@ answer_parser = partial(
     ],
     extraction_mode="first_match",
 )
-solution_parser = partial(
-    parse, extraction_config=[LatexExtractionConfig()], extraction_mode="first_match"
-)
+solution_parser = partial(parse, extraction_config=[LatexExtractionConfig()], extraction_mode="first_match")
 
 
 # def accuracy_reward(completions, solution, **kwargs):
@@ -110,22 +109,11 @@ def accuracy_reward(completions, answer, **kwargs):
 
 
 def format_reward(completions, **kwargs):
-    """Reward function that gives:
-    - 0.25 points if </think> tag is present
-    - 0.25 points if \boxed{ is present
-    - Additional 0.5 points if both are present
-    """
     completion_contents = [completion[0]["content"] for completion in completions]
     rewards = []
 
     for content in completion_contents:
         reward = 0.0
-        # if "</think>" in content:
-        #     reward += 0.25
-        # if "\\boxed{" in content:
-        #     reward += 0.25
-        # if "</think>" in content and "\\boxed{" in content:
-        #     reward += 0.5
         if content.count("<think>\n") == 1:
             reward += 1.0 / 3
         if content.count("\n</think>\n") == 1:
@@ -134,10 +122,29 @@ def format_reward(completions, **kwargs):
             reward += 1.0 / 3
         rewards.append(reward)
 
-    # print(f"completion_contents: {completion_contents[0]}")
-    # print(rewards[0])
-
     return rewards
+
+
+def tag_count_reward(completions, **kwargs) -> list[float]:
+    """Reward function that checks if we produce the desired number of think and answer tags associated with `format_reward()`.
+
+    Adapted from: https://gist.github.com/willccbb/4676755236bb08cab5f4e54a0475d6fb#file-grpo_demo-py-L90
+    """
+
+    def count_tags(text: str) -> float:
+        count = 0.0
+        if text.count("<think>\n") == 1:
+            count += 0.25
+        if text.count("\n</think>\n") == 1:
+            count += 0.25
+        if text.count("\n<answer>\n") == 1:
+            count += 0.25
+        if text.count("\n</answer>") == 1:
+            count += 0.25
+        return count
+
+    contents = [completion[0]["content"] for completion in completions]
+    return [count_tags(c) for c in contents]
 
 
 def reasoning_steps_reward(completions, **kwargs):
@@ -157,9 +164,7 @@ def reasoning_steps_reward(completions, **kwargs):
     return [min(1.0, count / 3) for count in matches]
 
 
-def len_reward(
-    completions: list[Dict[str, str]], solutions: list[str], **kwargs
-) -> float:
+def len_reward(completions: list[Dict[str, str]], solutions: list[str], **kwargs) -> float:
     """Compute length-based rewards to discourage overthinking and promote token efficiency.
 
     Taken from from the Kimi 1.5 tech report: https://arxiv.org/abs/2501.12599
@@ -177,7 +182,7 @@ def len_reward(
 
     # First check correctness of answers
     correctness = []
-    for content, sol in zip(contents, solution):
+    for content, sol in zip(contents, solutions):
         gold_parsed = parse(
             sol,
             extraction_mode="first_match",
@@ -397,9 +402,7 @@ def code_reward(completions, **kwargs) -> list[float]:
 
         evaluate_code(code_snippet, test_cases)
         """
-        code_snippets = [
-            extract_code(completion[-1]["content"]) for completion in completions
-        ]
+        code_snippets = [extract_code(completion[-1]["content"]) for completion in completions]
         verification_info = kwargs["verification_info"]
         scripts = [
             evaluation_script_template.format(
@@ -428,14 +431,11 @@ def get_code_format_reward(language: str = "python"):
     Args:
         language: Programming language supported by E2B https://e2b.dev/docs/code-interpreting/supported-languages
     """
-    pattern = rf"^<think>.*?</think>\s*<answer>.*?```{language}\n.*?```.*?</answer>$"
+    pattern = rf"^<think>\n.*?\n</think>\n<answer>\n.*?```{language}.*?```.*?\n</answer>$"
 
     def code_format_reward(completions, **kwargs):
         completion_contents = [completion[0]["content"] for completion in completions]
-        matches = [
-            re.match(pattern, content, re.DOTALL | re.MULTILINE)
-            for content in completion_contents
-        ]
+        matches = [re.match(pattern, content, re.DOTALL | re.MULTILINE) for content in completion_contents]
         return [1.0 if match else 0.0 for match in matches]
 
     return code_format_reward
