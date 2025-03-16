@@ -33,6 +33,7 @@ lora_target_modules:
 - down_proj
 
 warmup_ratio: 0.05
+optim: adamw_bnb_8bit
 gradient_accumulation_steps: 8
 learning_rate: 4.0e-5
 max_grad_norm: 1.0
@@ -70,6 +71,8 @@ save_total_limit: 1
 log_level: error
 logging_strategy: steps
 logging_steps: 1
+
+eval_strategy: "no"
 
 max_steps: -1
 
