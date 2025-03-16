@@ -1,21 +1,16 @@
-from typing import Any, Callable
-
-import torch
 from deepspeed.runtime.engine import DeepSpeedEngine
+import torch
 from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
 
 
 @torch.no_grad()
-def offload_deepspeed_model_to_cpu(model: DeepSpeedEngine, empty_cache: bool = True):
+def offload_deepspeed_model_to_cpu(model: DeepSpeedEngine):
     if is_deepspeed_zero3_enabled():
         model.empty_partition_cache()
     else:
         for param in model.parameters():
             param.data.to("cpu", non_blocking=True)
-
-    if empty_cache:
-        torch.cuda.empty_cache()
-
+            
 
 @torch.no_grad()
 def load_deepspeed_model_to_gpu(model: DeepSpeedEngine):
@@ -29,8 +24,14 @@ def load_deepspeed_model_to_gpu(model: DeepSpeedEngine):
 
 @torch.no_grad()
 def offload_deepspeed_optimizer(optimizer: torch.optim.Optimizer):
+    if is_deepspeed_zero3_enabled():
+        # Set offload_optimizer_device: "cpu" in deepspeed_config for offloading in zero3
+        # optimizer.offload_states() is supported only for DeepSpeed FusedAdam.
+        return
+    
     if not optimizer.state:
         return
+    
     for param_group in optimizer.param_groups:
         for param in param_group["params"]:
             state = optimizer.state[param]
@@ -41,8 +42,12 @@ def offload_deepspeed_optimizer(optimizer: torch.optim.Optimizer):
 
 @torch.no_grad()
 def load_deepspeed_optimizer(optimizer: torch.optim.Optimizer, device_id: torch.device):
+    if is_deepspeed_zero3_enabled():
+        return
+
     if not optimizer.state:
         return
+    
     for param_group in optimizer.param_groups:
         for param in param_group["params"]:
             state = optimizer.state[param]

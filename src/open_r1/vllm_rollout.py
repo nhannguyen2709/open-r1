@@ -2,18 +2,25 @@ import logging
 
 from accelerate import Accelerator
 from accelerate.utils import is_peft_model
+from accelerate.utils.other import is_compiled_module
 import deepspeed
 from deepspeed.runtime.engine import DeepSpeedEngine
 import torch
 from torch.distributed.device_mesh import DeviceMesh
 from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
 from trl.models import unwrap_model_for_generation
+
 from vllm import LLM
 from vllm.distributed import parallel_state as vllm_ps
 
 from open_r1.configs import vLLMConfig
 from open_r1.performance import log_gpu_memory_usage
-from open_r1.deepspeed_utils import offload_deepspeed_model_to_cpu, load_deepspeed_model_to_gpu
+from open_r1.deepspeed_utils import (
+    offload_deepspeed_model_to_cpu,
+    offload_deepspeed_optimizer,
+    load_deepspeed_model_to_gpu,
+    load_deepspeed_optimizer,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -110,9 +117,14 @@ class VLLMShardingManager:
         state_dict = {}
         if self.load_weights:
             log_gpu_memory_usage("Before state_dict() in sharding manager memory", logger=logger)
-            is_peft = is_peft_model(self.module.module)
-            if is_peft:
-                with unwrap_model_for_generation(self.module, self.accelerator) as unwrapped_model:
+            with unwrap_model_for_generation(
+                self.module,
+                self.accelerator,
+                gather_deepspeed3_params=is_deepspeed_zero3_enabled(),
+            ) as unwrapped_model:
+                if is_compiled_module(unwrapped_model):
+                    unwrapped_model = unwrapped_model._orig_mod
+                if is_peft_model(unwrapped_model):
                     unwrapped_model.merge_adapter()
                     state_dict = unwrapped_model.state_dict()
                     # Remove base_model and base_layer prefixes
@@ -121,21 +133,12 @@ class VLLMShardingManager:
                     state_dict = {k: v for k, v in state_dict.items() if unwrapped_model.prefix not in k}
                     # When module to save, remove its prefix and discard the original module
                     state_dict = {k.replace("modules_to_save.default.", ""): v for k, v in state_dict.items() if "original_module" not in k}
-
-                    # Unmerge the adapter to restore the model to its original state.
-                    # This must be done after loading weights to ensure they correspond to the merged state.
-                    if is_peft_model(unwrapped_model):
-                        unwrapped_model.unmerge_adapter()
-                    state_dict = {k: v.cpu() for k, v in state_dict.items()}
-
-            elif is_deepspeed_zero3_enabled():
-                state_dict = {}
-                for name, param in self.module.module.named_parameters():
-                    with deepspeed.zero.GatheredParameters([param]):
-                        state_dict[name] = param.data
-                    state_dict[name] = state_dict[name].cpu()
-            else:
-                state_dict = self.module.module.state_dict()
+                else:
+                    state_dict = unwrapped_model.state_dict()
+                # Unmerge the adapter to restore the model to its original state.
+                # This must be done after loading weights to ensure they correspond to the merged state.
+                if is_peft_model(unwrapped_model):
+                    unwrapped_model.unmerge_adapter()
                 state_dict = {k: v.cpu() for k, v in state_dict.items()}
 
             torch.cuda.empty_cache()
@@ -158,6 +161,7 @@ class VLLMShardingManager:
         log_gpu_memory_usage("After del state_dict and empty_cache in sharding manager", logger=logger)
 
         offload_deepspeed_model_to_cpu(self.module)
+        offload_deepspeed_optimizer(self.module.optimizer)
         torch.cuda.empty_cache()
         log_gpu_memory_usage("After offload model weights in sharding manager", logger=logger)
 
@@ -172,6 +176,7 @@ class VLLMShardingManager:
         log_gpu_memory_usage("After vllm offload in sharding manager", logger=logger)
 
         load_deepspeed_model_to_gpu(self.module)
+        load_deepspeed_optimizer(self.module.optimizer, torch.cuda.current_device())
 
         # add empty cache after each compute
         torch.cuda.empty_cache()
