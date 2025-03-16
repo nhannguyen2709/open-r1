@@ -189,9 +189,9 @@ def main(script_args, training_args, model_args):
             max_penalty=script_args.repetition_max_penalty,
         ),
         "length": len_reward,
-        "code": code_reward,
-        "code_format": get_code_format_reward(language=script_args.code_language),
-        "tag_count": tag_count_reward,
+        # "code": code_reward,
+        # "code_format": get_code_format_reward(language=script_args.code_language),
+        # "tag_count": tag_count_reward,
     }
     reward_funcs = [REWARD_FUNCS_REGISTRY[func] for func in script_args.reward_funcs]
 
