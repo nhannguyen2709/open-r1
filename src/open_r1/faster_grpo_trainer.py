@@ -91,7 +91,6 @@ if is_wandb_available():
     import wandb
 
 from open_r1.configs import GRPOConfig
-from open_r1.deepspeed_utils import _DeepSpeedForwardRedirection
 from open_r1.grpo_loss import LigerFusedLinearGRPOLoss
 from open_r1.performance import log_gpu_memory_usage
 from open_r1.vllm_rollout import vLLMRollout, VLLMShardingManager
@@ -667,80 +666,28 @@ class FastGRPOTrainer(Trainer):
                         attention_mask,
                         logits_to_keep,
                     )
-
-        grpo_loss_fn = LigerFusedLinearGRPOLoss(beta=self.args.beta, epsilon=self.args.epsilon, compiled=False)
-
-        def grpo_partial(last_hidden_state, lm_head, input_ids, attention_mask, advantages, ref_per_token_logps, old_per_token_logps):
-            return grpo_loss_fn(
-                last_hidden_state, lm_head.weight, input_ids, attention_mask, advantages, ref_per_token_logps, old_per_token_logps, lm_head.bias
-            )
-
         with self.accelerator.accumulate(self.model):
+            per_token_logps = self._get_per_token_logps(
+                self.model,
+                input_ids,
+                attention_mask,
+                logits_to_keep,
+            )
+            per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
             old_per_token_logps = self._buffer[idx]
-            if is_deepspeed_zero3_enabled():
-                outputs = _DeepSpeedForwardRedirection()(
-                    self.model, self.model.module.model, input_ids, attention_mask=attention_mask, use_cache=False
-                )
-            else:
-                if is_peft_model(self.model.module):
-                    outputs = self.model.module.model.model(input_ids, attention_mask=attention_mask, use_cache=False)
-                else:
-                    outputs = self.model.module.model(input_ids, attention_mask=attention_mask, use_cache=False)
-            last_hidden_state = outputs.last_hidden_state
-            last_hidden_state = last_hidden_state[:, :-1][:, -logits_to_keep:]
-            # Flattening tensors to pass to the GRPO loss function
-            last_hidden_state = last_hidden_state.flatten(0, 1)
-            input_ids = input_ids[:, -logits_to_keep:].flatten()
-            attention_mask = attention_mask[:, -logits_to_keep:].flatten()
-            advantages = advantages.repeat_interleave(logits_to_keep, dim=1).flatten()
-            ref_per_token_logps = ref_per_token_logps.flatten()
-            if old_per_token_logps is not None:
-                old_per_token_logps = old_per_token_logps.flatten()
-
-            if is_deepspeed_zero3_enabled():
-                loss, (per_token_logps, mean_kl, clip_ratio) = _DeepSpeedForwardRedirection()(
-                    self.model,
-                    grpo_partial,
-                    last_hidden_state,
-                    self.model.module.lm_head,
-                    input_ids,
-                    attention_mask,
-                    advantages,
-                    ref_per_token_logps,
-                    old_per_token_logps,
-                )
-            else:
-                loss, (per_token_logps, mean_kl, clip_ratio) = grpo_partial(
-                    last_hidden_state,
-                    self.model.module.lm_head,
-                    input_ids,
-                    attention_mask,
-                    advantages,
-                    ref_per_token_logps,
-                    old_per_token_logps,
-                )
-            self._buffer[idx] = per_token_logps.reshape(completion_ids.size())  # reshaped to match the completion_ids shape
-            # per_token_logps = self._get_per_token_logps(
-            #     self.model,
-            #     input_ids,
-            #     attention_mask,
-            #     logits_to_keep,
-            # )
-            # per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
-            # if old_per_token_logps is None:
-            #     old_per_token_logps = per_token_logps.detach()
-            # self._buffer[idx] = per_token_logps.detach()
-            # coef_1 = torch.exp(per_token_logps - old_per_token_logps)
-            # coef_2 = torch.clamp(coef_1, 1 - self.args.epsilon, 1 + self.args.epsilon)
-            # per_token_loss1 = coef_1 * advantages
-            # per_token_loss2 = coef_2 * advantages
-            # per_token_loss = torch.min(per_token_loss1, per_token_loss2)
-            # per_token_loss = -(per_token_loss - self.args.beta * per_token_kl)
-            # loss = (per_token_loss * completion_mask).sum() / completion_mask.sum()
-            # is_clipped = (per_token_loss1 < per_token_loss2).float()
-            # clip_ratio = (is_clipped * completion_mask).sum() / completion_mask.sum()
-            # mean_kl = (per_token_kl * completion_mask).sum() / completion_mask.sum()
-
+            if old_per_token_logps is None:
+                old_per_token_logps = per_token_logps.detach()
+            self._buffer[idx] = per_token_logps.detach()
+            coef_1 = torch.exp(per_token_logps - old_per_token_logps)
+            coef_2 = torch.clamp(coef_1, 1 - self.args.epsilon, 1 + self.args.epsilon)
+            per_token_loss1 = coef_1 * advantages
+            per_token_loss2 = coef_2 * advantages
+            per_token_loss = torch.min(per_token_loss1, per_token_loss2)
+            per_token_loss = -(per_token_loss - self.args.beta * per_token_kl)
+            loss = (per_token_loss * completion_mask).sum() / completion_mask.sum()
+            is_clipped = (per_token_loss1 < per_token_loss2).float()
+            clip_ratio = (is_clipped * completion_mask).sum() / completion_mask.sum()
+            mean_kl = (per_token_kl * completion_mask).sum() / completion_mask.sum()
             self.accelerator.backward(loss)
             # Run callbacks and optimizer steps
             self.control = self.callback_handler.on_pre_optimizer_step(self.args, self.state, self.control)
