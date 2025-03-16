@@ -264,12 +264,12 @@ class FastGRPOTrainer(Trainer):
             os.makedirs(self.args.output_dir, exist_ok=True)
         self.backup_model = None
 
-        # Build actor model + optimizer, reference model
-        if is_deepspeed_zero3_enabled() and peft_config is not None:
-            raise ValueError(
-                "PEFT (Parameter-Efficient Fine-Tuning) is not supported with DeepSpeed ZeRO-3. "
-                "Please disable DeepSpeed ZeRO-3 or use a different training configuration without PEFT."
-            )
+        # # Build actor model + optimizer, reference model
+        # if is_deepspeed_zero3_enabled() and peft_config is not None:
+        #     raise ValueError(
+        #         "PEFT (Parameter-Efficient Fine-Tuning) is not supported with DeepSpeed ZeRO-3. "
+        #         "Please disable DeepSpeed ZeRO-3 or use a different training configuration without PEFT."
+        #     )
         if peft_config is not None:
             model = get_peft_model(model, peft_config)
 
@@ -758,12 +758,15 @@ def mini_batch_collator(examples, processing_class, max_prompt_length):
         prompt_mask = prompt_mask[:, -max_prompt_length:]
     completion_ids = pad(completion_ids, pad_token_id, "right")
 
-    # Mask everything after the first EOS token
     is_eos = completion_ids == processing_class.eos_token_id
-    eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long)
-    eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
-    sequence_indices = torch.arange(is_eos.size(1)).expand(is_eos.size(0), -1)
-    completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
+    if is_eos.any(dim=1).any().item():    
+        # Mask everything after the first EOS token
+        eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long)
+        eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
+        sequence_indices = torch.arange(is_eos.size(1)).expand(is_eos.size(0), -1)
+        completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
+    else:
+        completion_mask = torch.ones_like(completion_ids, dtype=torch.int32)
 
     return {
         "prompt_ids": prompt_ids,
