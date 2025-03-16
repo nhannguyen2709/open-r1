@@ -1,54 +1,73 @@
 # Model arguments
-model_name_or_path: Qwen/Qwen2.5-Math-7B
+wandb_entity: castalk-inc
+wandb_project: aimo
 model_revision: main
 torch_dtype: bfloat16
 attn_implementation: flash_attention_2
+use_liger_kernel: true
 
 # Data training arguments
-dataset_name: DigitalLearningGmbH/MATH-lighteval
+num_processes: 4
+dataset_name: open-r1/OpenR1-Math-220k
 dataset_configs:
 - train
-system_prompt: "You are a helpful AI Assistant, designed to provided well-reasoned and detailed responses. You FIRST think about the reasoning process as an internal monologue and then provide the user with the answer. The reasoning process MUST BE enclosed within <think> and </think> tags."
 
-# GRPO trainer config
+use_peft: true
+lora_task_type: CAUSAL_LM
+lora_r: 32
+lora_alpha: 16
+lora_dropout: 0.05
+lora_target_modules:
+- q_proj
+- v_proj
+- k_proj
+- o_proj
+- gate_proj
+- up_proj
+- down_proj
+
+warmup_ratio: 0.05
+gradient_accumulation_steps: 2
+learning_rate: 5.0e-5
+logging_steps: 1
+num_generations: 4
+max_prompt_length: 512
+max_completion_length: 8192
+per_device_eval_batch_size: 4
+per_device_train_batch_size: 4
+model_name_or_path: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+output_dir: data/Qwen-2.5-7B-Simple-RL
+hub_model_id: DeepSeek-R1-Distill-Qwen-7B
+# model_name_or_path: agentica-org/DeepScaleR-1.5B-Preview
+# output_dir: data/DeepScaleR-1.5B-Simple-RL-3
+# hub_model_id: DeepScaleR-1.5B-Preview
+hub_strategy: every_save
+num_train_epochs: 3
+overwrite_output_dir: true
+temperature: 0.6
 bf16: true
 use_vllm: true
 vllm_device: auto
-vllm_gpu_memory_utilization: 0.7
+vllm_gpu_memory_utilization: 0.9
+
+# GRPO trainer config
 do_eval: true
 eval_strategy: steps
 eval_steps: 100
-gradient_accumulation_steps: 8
 gradient_checkpointing: true
 gradient_checkpointing_kwargs:
   use_reentrant: false
-hub_model_id: Qwen-2.5-7B-Simple-RL
-hub_strategy: every_save
-learning_rate: 3.0e-06
-log_completions: true
+
 log_level: info
-logging_first_step: true
-logging_steps: 5
 logging_strategy: steps
 lr_scheduler_type: cosine
-max_prompt_length: 512
-max_completion_length: 1024
 max_steps: -1
-num_generations: 7
-num_train_epochs: 1
-output_dir: data/Qwen-2.5-7B-Simple-RL
-overwrite_output_dir: true
-per_device_eval_batch_size: 16
-per_device_train_batch_size: 16
-push_to_hub: true
+
+push_to_hub: false
 report_to:
 - wandb
-reward_funcs:
-- accuracy
-- format
-reward_weights:
-- 1.0
-- 1.0
-save_strategy: "no"
+save_strategy: steps
+save_steps: 100
 seed: 42
-warmup_ratio: 0.1
+
+num_iterations: 4

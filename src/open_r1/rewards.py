@@ -1,5 +1,6 @@
 """Reward functions for GRPO training."""
 
+from functools import partial
 import json
 import math
 import re
@@ -18,54 +19,110 @@ if is_e2b_available():
     load_dotenv()
 
 
-def accuracy_reward(completions, solution, **kwargs):
+answer_parser = partial(
+    parse,
+    extraction_config=[
+        LatexExtractionConfig(
+            normalization_config=NormalizationConfig(
+                nits=False,
+                malformed_operators=False,
+                basic_latex=True,
+                equations=True,
+                boxed="all",
+                units=True,
+            ),
+            # Ensures that boxed is tried first
+            boxed_match_priority=0,
+            try_extract_without_anchor=False,
+        )
+    ],
+    extraction_mode="first_match",
+)
+solution_parser = partial(parse, extraction_config=[LatexExtractionConfig()], extraction_mode="first_match")
+
+
+# def accuracy_reward(completions, solution, **kwargs):
+#     """Reward function that checks if the completion is the same as the ground truth."""
+#     contents = [completion[0]["content"] for completion in completions]
+#     rewards = []
+#     for content, sol in zip(contents, solution):
+#         gold_parsed = solution_parser(sol)
+#         if len(gold_parsed) != 0:
+#             # We require the answer to be provided in correct latex (no malformed operators)
+#             answer_parsed = answer_parser(content)
+#             # Reward 1 if the content is the same as the ground truth, 0 otherwise
+#             reward = float(verify(answer_parsed, gold_parsed))
+#         else:
+#             # If the gold solution is not parseable, we reward 1 to skip this example
+#             reward = 1.0
+#             # print("Failed to parse gold solution: ", sol)
+#         rewards.append(reward)
+
+#     return rewards
+
+
+def extract_boxed_text(text):
+    pattern = r"oxed{(.*?)}"
+    matches = re.findall(pattern, text)
+    if not matches:
+        return ""
+    for match in matches[::-1]:
+        if match != "":
+            return match
+    return ""
+
+
+def accuracy_reward(completions, answer, **kwargs):
     """Reward function that checks if the completion is the same as the ground truth."""
     contents = [completion[0]["content"] for completion in completions]
     rewards = []
-    for content, sol in zip(contents, solution):
-        gold_parsed = parse(
-            sol,
-            extraction_mode="first_match",
-            extraction_config=[LatexExtractionConfig()],
-        )
-        if len(gold_parsed) != 0:
-            # We require the answer to be provided in correct latex (no malformed operators)
-            answer_parsed = parse(
-                content,
-                extraction_config=[
-                    LatexExtractionConfig(
-                        normalization_config=NormalizationConfig(
-                            nits=False,
-                            malformed_operators=False,
-                            basic_latex=True,
-                            equations=True,
-                            boxed="all",
-                            units=True,
-                        ),
-                        # Ensures that boxed is tried first
-                        boxed_match_priority=0,
-                        try_extract_without_anchor=False,
-                    )
-                ],
-                extraction_mode="first_match",
-            )
-            # Reward 1 if the content is the same as the ground truth, 0 otherwise
-            reward = float(verify(answer_parsed, gold_parsed))
-        else:
-            # If the gold solution is not parseable, we reward 1 to skip this example
-            reward = 1.0
-            print("Failed to parse gold solution: ", sol)
+    for content, ans in zip(contents, answer):
+        # print(f"content: {content}")
+        # print(f"ans: {ans}")
+        # We require the answer to be provided in correct latex (no malformed operators)
+        answer_parsed = extract_boxed_text(content)
+
+        # Reward 1 if the answer_parsed is the same as the ground truth, 0 otherwise
+        # print(f"answer_parsed: {answer_parsed}")
+        try:
+            parsed_value = float(answer_parsed) if answer_parsed else -1e9
+            reward = float(int(parsed_value) == int(ans))
+        except ValueError:
+            reward = 0.0
+        # print(f"reward: {reward}")
         rewards.append(reward)
 
     return rewards
 
 
+# def format_reward(completions, **kwargs):
+#     """Reward function that checks if the reasoning process is enclosed within <think> and </think> tags, while the final answer is enclosed within <answer> and </answer> tags."""
+#     pattern = r"^<think>.*?</think>\s*<answer>.*?</answer>$"
+#     completion_contents = [completion[0]["content"] for completion in completions]
+#     matches = [
+#         re.match(pattern, content, re.DOTALL | re.MULTILINE)
+#         for content in completion_contents
+#     ]
+#     print(f"completion_contents: {completion_contents}")
+#     print(f"matches: {matches}")
+#     return [1.0 if match else 0.0 for match in matches]
+
+
 def format_reward(completions, **kwargs):
-    """Reward function that checks if the reasoning process is enclosed within <think> and </think> tags, while the final answer is enclosed within <answer> and </answer> tags."""
-    pattern = r"^<think>\n.*?\n</think>\n<answer>\n.*?\n</answer>$"
     completion_contents = [completion[0]["content"] for completion in completions]
-    matches = [re.match(pattern, content, re.DOTALL | re.MULTILINE) for content in completion_contents]
-    return [1.0 if match else 0.0 for match in matches]
+    rewards = []
+
+    for content in completion_contents:
+        reward = 0.0
+        if content.count("<think>\n") == 1:
+            reward += 1.0 / 3
+        if content.count("\n</think>\n") == 1:
+            reward += 1.0 / 3
+        if "\\boxed{" in content:
+            reward += 1.0 / 3
+        rewards.append(reward)
+
+    return rewards
 
 
 def tag_count_reward(completions, **kwargs) -> list[float]:
@@ -107,7 +164,7 @@ def reasoning_steps_reward(completions, **kwargs):
     return [min(1.0, count / 3) for count in matches]
 
 
-def len_reward(completions: list[Dict[str, str]], solution: list[str], **kwargs) -> float:
+def len_reward(completions: list[Dict[str, str]], solutions: list[str], **kwargs) -> float:
     """Compute length-based rewards to discourage overthinking and promote token efficiency.
 
     Taken from from the Kimi 1.5 tech report: https://arxiv.org/abs/2501.12599
@@ -125,7 +182,7 @@ def len_reward(completions: list[Dict[str, str]], solution: list[str], **kwargs)
 
     # First check correctness of answers
     correctness = []
-    for content, sol in zip(contents, solution):
+    for content, sol in zip(contents, solutions):
         gold_parsed = parse(
             sol,
             extraction_mode="first_match",
@@ -187,7 +244,7 @@ def get_cosine_scaled_reward(
     max_value_correct: float = 1.0,
     max_len: int = 1000,
 ):
-    def cosine_scaled_reward(completions, solution, **kwargs):
+    def cosine_scaled_reward(completions, answer, **kwargs):
         """Reward function that scales based on completion length using a cosine schedule.
 
         Shorter correct solutions are rewarded more than longer ones.
@@ -207,33 +264,18 @@ def get_cosine_scaled_reward(
         contents = [completion[0]["content"] for completion in completions]
         rewards = []
 
-        for content, sol in zip(contents, solution):
-            gold_parsed = parse(sol, extraction_mode="first_match", extraction_config=[LatexExtractionConfig()])
-            if len(gold_parsed) == 0:
-                rewards.append(1.0)  # Skip unparseable examples
-                print("Failed to parse gold solution: ", sol)
-                continue
+        for content, ans in zip(contents, answer):
+            answer_parsed = extract_boxed_text(content)
 
-            answer_parsed = parse(
-                content,
-                extraction_config=[
-                    LatexExtractionConfig(
-                        normalization_config=NormalizationConfig(
-                            nits=False,
-                            malformed_operators=False,
-                            basic_latex=True,
-                            equations=True,
-                            boxed=True,
-                            units=True,
-                        ),
-                        boxed_match_priority=0,
-                        try_extract_without_anchor=False,
-                    )
-                ],
-                extraction_mode="first_match",
-            )
+            # Reward 1 if the answer_parsed is the same as the ground truth, 0 otherwise
+            # print(f"answer_parsed: {answer_parsed}")
+            try:
+                parsed_value = float(answer_parsed) if answer_parsed else -1e9
+                _reward = float(int(parsed_value) == int(ans))
+            except ValueError:
+                _reward = 0.0
 
-            is_correct = verify(answer_parsed, gold_parsed)
+            is_correct = bool(_reward)
             gen_len = len(content)
 
             # Apply cosine scaling based on length
@@ -364,7 +406,8 @@ def code_reward(completions, **kwargs) -> list[float]:
         verification_info = kwargs["verification_info"]
         scripts = [
             evaluation_script_template.format(
-                code=json.dumps(code), test_cases=json.dumps(json.dumps(info["test_cases"]))
+                code=json.dumps(code),
+                test_cases=json.dumps(json.dumps(info["test_cases"])),
             )
             for code, info in zip(code_snippets, verification_info)
         ]
