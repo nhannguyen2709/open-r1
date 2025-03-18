@@ -157,8 +157,8 @@ def main(script_args, training_args, model_args):
     ################
     # Load the dataset
     ################
-    train_dataset = load_dataset(script_args.dataset_name, split=script_args.dataset_train_split)
-    train_dataset = train_dataset.filter(lambda x: len(x["filter_generations"]) > 0)
+    # train_dataset = load_dataset(script_args.dataset_name, split=script_args.dataset_train_split)
+    train_dataset = load_dataset("parquet", data_files="/home/andy/data/r1-hard-e2h.parquet")
     train_dataset = train_dataset.map(make_conversation)
 
     eval_dataset = None
