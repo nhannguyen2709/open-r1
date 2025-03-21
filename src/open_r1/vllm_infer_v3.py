@@ -184,8 +184,12 @@ def predict_for_question(
             predictions.append(completion_text)
             lengths.append(len(completion_ids))
     # re-calculate rewards, then select answer with highest total reward
-    all_rewards = get_rewards(prm, prm_tokenizer, question, predictions)
-    answer = select_answer(all_extracted_answers, all_rewards)
+    if len(predictions) > 0:
+        all_rewards = get_rewards(prm, prm_tokenizer, question, predictions)
+        answer = select_answer(all_extracted_answers, all_rewards)
+    else:
+        answer = 210
+        print(f"No prediction contains \\boxed{{}}, using 210 as answer")
 
     print(f"Max length: {max(lengths)}, Min length: {min(lengths)}, Mean length: {sum(lengths) / len(lengths)}")
     print(f"Time taken: {time.time() - start:.2f} seconds")
