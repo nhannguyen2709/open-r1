@@ -132,7 +132,7 @@ def predict_for_question(
         num_seqs = 2 * max_num_seqs // 3
 
     start = time.time()
-    turn_1_max_tokens = 3584
+    turn_1_max_tokens = 2048
     num_seqs_to_keep = 16
     stop = None
     sampling_kwargs = {
