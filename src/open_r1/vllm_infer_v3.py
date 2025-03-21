@@ -132,7 +132,7 @@ def predict_for_question(
         num_seqs = 2 * max_num_seqs // 3
 
     start = time.time()
-    turn_1_max_tokens = 2048
+    turn_1_max_tokens = 3072
     num_seqs_to_keep = 16
     stop = None
     sampling_kwargs = {
@@ -187,13 +187,13 @@ def predict_for_question(
     if len(predictions) > 0:
         all_rewards = get_rewards(prm, prm_tokenizer, question, predictions)
         answer = select_answer(all_extracted_answers, all_rewards)
+        print(f"Max length: {max(lengths)}, Min length: {min(lengths)}, Mean length: {sum(lengths) / len(lengths)}")
+        print(f"Candidates: {[(answer, reward) for answer, reward in zip(all_extracted_answers, all_rewards)]}")
     else:
         answer = 210
         print(f"No prediction contains \\boxed{{}}, using 210 as answer")
 
-    print(f"Max length: {max(lengths)}, Min length: {min(lengths)}, Mean length: {sum(lengths) / len(lengths)}")
     print(f"Time taken: {time.time() - start:.2f} seconds")
-    print(f"Candidates: {[(answer, reward) for answer, reward in zip(all_extracted_answers, all_rewards)]}")
     print(f"Final answer: {answer} - Ground truth: {ground_truth}")
 
     cutoff_times.pop()
