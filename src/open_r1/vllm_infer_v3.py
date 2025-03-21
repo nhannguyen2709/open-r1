@@ -261,7 +261,7 @@ def main(
         max_model_len=max_model_len,  # Model context length
         trust_remote_code=True,  # Trust remote code (e.g., from HuggingFace) when downloading the model and tokenizer
         tensor_parallel_size=torch.cuda.device_count(),  # The number of GPUs to use for distributed execution with tensor parallelism
-        gpu_memory_utilization=0.8,  # The ratio (between 0 and 1) of GPU memory to reserve for the model
+        gpu_memory_utilization=0.9,  # The ratio (between 0 and 1) of GPU memory to reserve for the model
         seed=3407,
         enforce_eager=False,
         enable_prefix_caching=True,
