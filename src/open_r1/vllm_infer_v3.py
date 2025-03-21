@@ -73,18 +73,24 @@ def extract_boxed_text(text):
 
 def select_answer(answers: list[str], scores: list[float]) -> int:
     """
-    Majority vote with random tie-breaker.
+    Majority vote with averaging of scores.
     """
-    counter = Counter()
+    score_sums = {}
+    score_counts = {}
     for i, answer in enumerate(answers):
         try:
             if int(answer) == float(answer):
-                counter[int(answer)] += scores[i]
+                answer_int = int(answer)
+                score_sums[answer_int] = score_sums.get(answer_int, 0) + scores[i]
+                score_counts[answer_int] = score_counts.get(answer_int, 0) + 1
         except:
             pass
-    if not counter:
+    if not score_sums:
         return 210
-    _, answer = sorted([(v, k) for k, v in counter.items()], reverse=True)[0]
+    # Calculate average score for each answer
+    avg_scores = {k: score_sums[k] / score_counts[k] for k in score_sums}
+    # Sort by average score and get the highest scoring answer
+    _, answer = sorted([(v, k) for k, v in avg_scores.items()], reverse=True)[0]
     return str(answer)
 
 
