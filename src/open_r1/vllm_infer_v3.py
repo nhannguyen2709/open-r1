@@ -132,7 +132,7 @@ def predict_for_question(
         num_seqs = 2 * max_num_seqs // 3
 
     start = time.time()
-    turn_1_max_tokens = 2048
+    turn_1_max_tokens = 3584
     num_seqs_to_keep = 16
     stop = None
     sampling_kwargs = {
@@ -237,6 +237,8 @@ pd.set_option("display.max_colwidth", None)
 start_time = time.time()
 cutoff_time = start_time + (4 * 60 + 45) * 60
 cutoff_times = [int(x) for x in np.linspace(cutoff_time, start_time + 6 * 60, 50 + 1)]
+print(time.ctime(start_time))
+print([time.ctime(x) for x in cutoff_times])
 warnings.simplefilter("ignore")
 
 
