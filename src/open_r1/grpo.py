@@ -158,7 +158,7 @@ def main(script_args, training_args, model_args):
     # Load the dataset
     ################
     # train_dataset = load_dataset(script_args.dataset_name, split=script_args.dataset_train_split)
-    train_dataset = load_dataset("parquet", data_files="/home/andy/data/r1-hard-e2h.parquet")
+    train_dataset = load_dataset("parquet", data_files="/home/andy/data/r1-hard-e2h.parquet", split="train")
     train_dataset = train_dataset.map(make_conversation)
 
     eval_dataset = None
@@ -252,7 +252,6 @@ def main(script_args, training_args, model_args):
 
     # Save everything else on main process
     kwargs = {
-        "dataset_name": script_args.dataset_name,
         "tags": ["open-r1"],
     }
     if trainer.accelerator.is_main_process:
