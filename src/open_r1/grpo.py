@@ -157,8 +157,10 @@ def main(script_args, training_args, model_args):
     ################
     # Load the dataset
     ################
-    # train_dataset = load_dataset(script_args.dataset_name, split=script_args.dataset_train_split)
-    train_dataset = load_dataset("parquet", data_files="/home/andy/data/r1-hard-e2h.parquet")
+    train_dataset = load_dataset(script_args.dataset_name, split=script_args.dataset_train_split)
+    # train_dataset = load_dataset("parquet", data_files="/home/andy/data/r1-hard-e2h.parquet", split="train")
+    train_dataset = train_dataset.filter(lambda x: len(x["filter_generations"]) > 0)
+    train_dataset = train_dataset.select(range(256))
     train_dataset = train_dataset.map(make_conversation)
 
     eval_dataset = None
@@ -226,14 +228,7 @@ def main(script_args, training_args, model_args):
     # Training loop
     ###############
     logger.info("*** Train ***")
-    if training_args.resume_from_checkpoint is not None:
-        trainer.model.load_adapter(
-            training_args.resume_from_checkpoint,
-            trainer.model.active_adapter,
-            is_trainable=True,
-        )
-        train_result = trainer.train()
-    elif last_checkpoint is not None:
+    if last_checkpoint is not None:
         train_result = trainer.train(resume_from_checkpoint=last_checkpoint)
     else:
         train_result = trainer.train()

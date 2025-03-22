@@ -91,7 +91,6 @@ if is_wandb_available():
     import wandb
 
 from open_r1.configs import GRPOConfig
-from open_r1.grpo_loss import LigerFusedLinearGRPOLoss
 from open_r1.performance import log_gpu_memory_usage
 from open_r1.vllm_rollout import vLLMRollout, VLLMShardingManager
 
@@ -162,9 +161,18 @@ class FastGRPOTrainer(Trainer):
                     "This argument can only be used when the `model` argument is a string."
                 )
 
+        from open_r1.monkey_patch import lce_forward
+
+        model.forward = lce_forward.__get__(model, type(model))
+
+        if peft_config is not None:
+            model = get_peft_model(model, peft_config)
+
         # Enable gradient checkpointing if requested
         if args.gradient_checkpointing:
             model = self._enable_gradient_checkpointing(model, args)
+
+        self.model = model
 
         # Processing class
         if processing_class is None:
@@ -263,17 +271,6 @@ class FastGRPOTrainer(Trainer):
         if self.args.should_save:
             os.makedirs(self.args.output_dir, exist_ok=True)
         self.backup_model = None
-
-        # # Build actor model + optimizer, reference model
-        # if is_deepspeed_zero3_enabled() and peft_config is not None:
-        #     raise ValueError(
-        #         "PEFT (Parameter-Efficient Fine-Tuning) is not supported with DeepSpeed ZeRO-3. "
-        #         "Please disable DeepSpeed ZeRO-3 or use a different training configuration without PEFT."
-        #     )
-        if peft_config is not None:
-            model = get_peft_model(model, peft_config)
-
-        self.model = model
 
         if self.beta == 0.0:
             # If beta is 0.0, the reference model is not needed
@@ -430,15 +427,22 @@ class FastGRPOTrainer(Trainer):
         torch.distributed.barrier()
         # build batch as list of dicts
         examples = []
+        import numpy as np
+
+        sft_completions = []
+        for i in range(len(prompts)):
+            sft_completions.extend(np.random.choice(batch[i]["filter_generations"], size=self.args.num_generations).tolist())
+
         for i, prompt in enumerate(repeated_prompts):
             example = {
-                "prompt": prompt,
+                "prompt": prompts_text[i // self.args.num_generations],
                 "prompt_ids": prompt_ids[i // self.args.num_generations],
                 "prompt_mask": prompt_mask[i // self.args.num_generations],
                 "completion": completions_text[i],
                 "completion_ids": completion_ids[i],
                 "advantages": advantages[i],
                 "rewards": rewards[i],
+                "sft_completion": sft_completions[i],
             }
             examples.append(example)
         # sort examples by length of prompt_ids and completion_ids
@@ -638,7 +642,6 @@ class FastGRPOTrainer(Trainer):
 
     def _optimization_step(self, mini_batch: dict[str, torch.Tensor | list[str]], idx: int, iteration: int):
         device = self.accelerator.device
-        prompts = mini_batch.pop("prompts")
         mini_batch = {k: v.to(device) for k, v in mini_batch.items()}
         prompt_ids = mini_batch["prompt_ids"]
         prompt_mask = mini_batch["prompt_mask"]
@@ -648,46 +651,55 @@ class FastGRPOTrainer(Trainer):
         rewards = mini_batch["rewards"]
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
-        logits_to_keep = completion_ids.size(1)
+        completion_size = completion_ids.size(1)
+        sft_prompt_ids = mini_batch["sft_prompt_ids"]
+        sft_prompt_mask = mini_batch["sft_prompt_mask"]
+        sft_completion_ids = mini_batch["sft_completion_ids"]
+        sft_completion_mask = mini_batch["sft_completion_mask"]
+        sft_input_ids = torch.cat([sft_prompt_ids, sft_completion_ids], dim=1)
+        sft_attention_mask = torch.cat([sft_prompt_mask, sft_completion_mask], dim=1)
+        sft_completion_size = sft_completion_ids.size(1)
 
-        with torch.inference_mode():
-            if self.ref_model is not None:
-                ref_per_token_logps = self._get_per_token_logps(
-                    self.ref_model,
-                    input_ids,
-                    attention_mask,
-                    logits_to_keep,
-                )
-            else:
-                with self.accelerator.unwrap_model(self.model).disable_adapter():
-                    ref_per_token_logps = self._get_per_token_logps(
-                        self.model,
-                        input_ids,
-                        attention_mask,
-                        logits_to_keep,
-                    )
-        with self.accelerator.accumulate(self.model):
-            per_token_logps = self._get_per_token_logps(
-                self.model,
-                input_ids,
-                attention_mask,
-                logits_to_keep,
-            )
-            per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
-            old_per_token_logps = self._buffer[idx]
-            if old_per_token_logps is None:
-                old_per_token_logps = per_token_logps.detach()
-            self._buffer[idx] = per_token_logps.detach()
-            coef_1 = torch.exp(per_token_logps - old_per_token_logps)
-            coef_2 = torch.clamp(coef_1, 1 - self.args.epsilon, 1 + self.args.epsilon)
-            per_token_loss1 = coef_1 * advantages
-            per_token_loss2 = coef_2 * advantages
-            per_token_loss = torch.min(per_token_loss1, per_token_loss2)
-            per_token_loss = -(per_token_loss - self.args.beta * per_token_kl)
-            loss = (per_token_loss * completion_mask).sum() / completion_mask.sum()
-            is_clipped = (per_token_loss1 < per_token_loss2).float()
-            clip_ratio = (is_clipped * completion_mask).sum() / completion_mask.sum()
-            mean_kl = (per_token_kl * completion_mask).sum() / completion_mask.sum()
+        # with torch.inference_mode():
+        #     if self.ref_model is not None:
+        #         ref_per_token_logps = self._get_per_token_logps(
+        #             self.ref_model,
+        #             input_ids,
+        #             attention_mask,
+        #             completion_size,
+        #         )
+        #     else:
+        #         with self.accelerator.unwrap_model(self.model).disable_adapter():
+        #             ref_per_token_logps = self._get_per_token_logps(
+        #                 self.model,
+        #                 input_ids,
+        #                 attention_mask,
+        #                 completion_size,
+        #             )
+        # with self.accelerator.accumulate(self.model):
+        #     per_token_logps = self._get_per_token_logps(
+        #         self.model,
+        #         input_ids,
+        #         attention_mask,
+        #         logits_to_keep,
+        #     )
+        #     per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
+        #     old_per_token_logps = self._buffer[idx]
+        #     if old_per_token_logps is None:
+        #         old_per_token_logps = per_token_logps.detach()
+        #     self._buffer[idx] = per_token_logps.detach()
+        #     coef_1 = torch.exp(per_token_logps - old_per_token_logps)
+        #     coef_2 = torch.clamp(coef_1, 1 - self.args.epsilon, 1 + self.args.epsilon)
+        #     per_token_loss1 = coef_1 * advantages
+        #     per_token_loss2 = coef_2 * advantages
+        #     per_token_loss = torch.min(per_token_loss1, per_token_loss2)
+        #     per_token_loss = -(per_token_loss - self.args.beta * per_token_kl)
+        #     loss = (per_token_loss * completion_mask).sum() / completion_mask.sum()
+        #     is_clipped = (per_token_loss1 < per_token_loss2).float()
+        #     clip_ratio = (is_clipped * completion_mask).sum() / completion_mask.sum()
+        #     mean_kl = (per_token_kl * completion_mask).sum() / completion_mask.sum()
+
+        
             self.accelerator.backward(loss)
             # Run callbacks and optimizer steps
             self.control = self.callback_handler.on_pre_optimizer_step(self.args, self.state, self.control)
@@ -744,6 +756,7 @@ def mini_batch_collator(examples, processing_class, max_prompt_length):
     advantages = []
     rewards = []
     prompts = []
+    sft_completions = []
     for example in examples:
         prompt_ids.append(torch.tensor(example["prompt_ids"]))
         prompt_mask.append(torch.tensor(example["prompt_mask"]))
@@ -751,6 +764,7 @@ def mini_batch_collator(examples, processing_class, max_prompt_length):
         advantages.append(example["advantages"])
         rewards.append(example["rewards"])
         prompts.append(example["prompt"])
+        sft_completions.append(example["sft_completion"])
     prompt_ids = pad(prompt_ids, pad_token_id, "left")
     prompt_mask = pad(prompt_mask, 0, "left")
     if max_prompt_length is not None:
@@ -759,7 +773,7 @@ def mini_batch_collator(examples, processing_class, max_prompt_length):
     completion_ids = pad(completion_ids, pad_token_id, "right")
 
     is_eos = completion_ids == processing_class.eos_token_id
-    if is_eos.any(dim=1).any().item():    
+    if is_eos.any(dim=1).any().item():
         # Mask everything after the first EOS token
         eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long)
         eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
@@ -768,6 +782,40 @@ def mini_batch_collator(examples, processing_class, max_prompt_length):
     else:
         completion_mask = torch.ones_like(completion_ids, dtype=torch.int32)
 
+    # Deduplicate sft_completions
+    prompts_sft_completions = list(set((prompt, sft_completion) for prompt, sft_completion in zip(prompts, sft_completions)))
+    sft_prompts = [prompt for prompt, _ in prompts_sft_completions]
+    sft_completions = [sft_completion for _, sft_completion in prompts_sft_completions]
+    sft_prompt_inputs = processing_class(
+        sft_prompts,
+        return_tensors="pt",
+        padding=True,
+        padding_side="left",
+        add_special_tokens=False,
+    )
+    sft_prompt_ids, sft_prompt_mask = (
+        sft_prompt_inputs["input_ids"],
+        sft_prompt_inputs["attention_mask"],
+    )
+    sft_prompt_ids = sft_prompt_ids[:, -max_prompt_length:]
+    sft_prompt_mask = sft_prompt_mask[:, -max_prompt_length:]
+    sft_completion_inputs = processing_class(sft_completions, add_special_tokens=False)
+    max_sft_completion_length = processing_class.model_max_length - sft_prompt_ids.size(1) - 1
+    for i in range(len(sft_completions)):
+        input_ids = sft_completion_inputs["input_ids"][i][-max_sft_completion_length:]
+        input_mask = sft_completion_inputs["attention_mask"][i][-max_sft_completion_length:]
+        sft_completion_inputs["input_ids"][i] = torch.LongTensor(input_ids + [processing_class.eos_token_id])
+        sft_completion_inputs["attention_mask"][i] = torch.LongTensor(input_mask + [1])
+    sft_completion_inputs["input_ids"] = pad(
+        sft_completion_inputs["input_ids"],
+        padding_value=processing_class.pad_token_id,
+    )
+    sft_completion_inputs["attention_mask"] = pad(sft_completion_inputs["attention_mask"], padding_value=0)
+    sft_completion_ids, sft_completion_mask = (
+        sft_completion_inputs["input_ids"],
+        sft_completion_inputs["attention_mask"],
+    )
+
     return {
         "prompt_ids": prompt_ids,
         "prompt_mask": prompt_mask,
@@ -775,5 +823,9 @@ def mini_batch_collator(examples, processing_class, max_prompt_length):
         "completion_mask": completion_mask,
         "advantages": torch.tensor(advantages),
         "rewards": torch.tensor(rewards),
-        "prompts": prompts,
+        # "prompts": prompts,
+        "sft_prompt_ids": sft_prompt_ids,
+        "sft_prompt_mask": sft_prompt_mask,
+        "sft_completion_ids": sft_completion_ids,
+        "sft_completion_mask": sft_completion_mask,
     }

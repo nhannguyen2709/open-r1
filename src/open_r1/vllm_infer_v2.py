@@ -13,7 +13,7 @@ import random
 from vllm import LLM, SamplingParams
 from transformers import PreTrainedTokenizer
 
-from open_r1.rewards import answer_parser
+# from open_r1.rewards import answer_parser
 from sympy import simplify
 import sys
 from fire import Fire
@@ -205,7 +205,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 pd.set_option("display.max_colwidth", None)
 start_time = time.time()
 cutoff_time = start_time + (4 * 60 + 45) * 60
-cutoff_times = [int(x) for x in np.linspace(cutoff_time, start_time + 180 * 60, 50 + 1)]
+cutoff_times = [int(x) for x in np.linspace(cutoff_time, start_time + 6 * 60, 50 + 1)]
 warnings.simplefilter("ignore")
 
 

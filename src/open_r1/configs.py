@@ -248,3 +248,7 @@ class ModelConfig(trl.ModelConfig):
         default="uint8",
         metadata={"help": "Storage type to pack the quanitzed 4-bit params."},
     )
+    quantization: Optional[str] = field(
+        default="",
+        metadata={"help": "Quantization method to use."},
+    )
