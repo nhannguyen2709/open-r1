@@ -423,8 +423,8 @@ class FastGRPOTrainer(Trainer):
 
         # calculate the advantages, the prompt is all on the same device to no need to gather here
         grouped_rewards = rewards.sum(dim=1).view(len(prompts), self.args.num_generations)
-        EPS = 1e-4
-        grouped_advantages = (grouped_rewards - grouped_rewards.mean(-1, keepdim=True)) / (grouped_rewards.std(-1, keepdim=True) + EPS)
+        # grouped_advantages = (grouped_rewards - grouped_rewards.mean(-1, keepdim=True)) / (grouped_rewards.std(-1, keepdim=True) + EPS)
+        grouped_advantages = grouped_rewards - grouped_rewards.mean(-1, keepdim=True)
         advantages = grouped_advantages.flatten().tolist()
 
         torch.distributed.barrier()
@@ -684,7 +684,8 @@ class FastGRPOTrainer(Trainer):
             per_token_loss2 = coef_2 * advantages
             per_token_loss = torch.min(per_token_loss1, per_token_loss2)
             per_token_loss = -(per_token_loss - self.args.beta * per_token_kl)
-            loss = (per_token_loss * completion_mask).sum() / completion_mask.sum()
+            # loss = (per_token_loss * completion_mask).sum() / completion_mask.sum()
+            loss = (per_token_loss * completion_mask).sum() / (per_token_loss.size(0) * self.max_completion_length)
             is_clipped = (per_token_loss1 < per_token_loss2).float()
             clip_ratio = (is_clipped * completion_mask).sum() / completion_mask.sum()
             mean_kl = (per_token_kl * completion_mask).sum() / completion_mask.sum()
@@ -759,7 +760,7 @@ def mini_batch_collator(examples, processing_class, max_prompt_length):
     completion_ids = pad(completion_ids, pad_token_id, "right")
 
     is_eos = completion_ids == processing_class.eos_token_id
-    if is_eos.any(dim=1).any().item():    
+    if is_eos.any(dim=1).any().item():
         # Mask everything after the first EOS token
         eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long)
         eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
