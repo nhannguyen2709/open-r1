@@ -1,7 +1,11 @@
 # Model arguments
-model_name_or_path: deepseek-ai/DeepSeek-R1-Distill-Qwen-14B
-output_dir: data/qwen-14b-grpo-v1
-resume_from_checkpoint: data/qwen-14b-grpo-v0/checkpoint-145
+# model_name_or_path: deepseek-ai/DeepSeek-R1-Distill-Qwen-14B
+# output_dir: data/qwen-14b-grpo-v1
+# resume_from_checkpoint: data/qwen-14b-grpo-v0/checkpoint-145
+
+model_name_or_path: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+output_dir: data/qwen-7b-v4
+
 model_revision: main
 torch_dtype: bfloat16
 attn_implementation: flash_attention_2
@@ -16,12 +20,12 @@ dataset_name: hoanganhpham/openr1_hard
 dataset_configs:
 - train
 chat_template: "{% if not add_generation_prompt is defined %}{% set add_generation_prompt = false %}{% endif %}{% set ns = namespace(is_first=false, is_tool=false, is_output_first=true, system_prompt='') %}{%- for message in messages %}{%- if message['role'] == 'system' %}{% set ns.system_prompt = message['content'] %}{%- endif %}{%- endfor %}{{bos_token}}{{ns.system_prompt}}{%- for message in messages %}{%- if message['role'] == 'user' %}{%- set ns.is_tool = false -%}{{'<｜User｜>' + message['content']}}{%- endif %}{%- if message['role'] == 'assistant' and message['content'] is none %}{%- set ns.is_tool = false -%}{%- for tool in message['tool_calls']%}{%- if not ns.is_first %}{{'<｜Assistant｜><｜tool▁calls▁begin｜><｜tool▁call▁begin｜>' + tool['type'] + '<｜tool▁sep｜>' + tool['function']['name'] + '\\n' + '```json' + '\\n' + tool['function']['arguments'] + '\\n' + '```' + '<｜tool▁call▁end｜>'}}{%- set ns.is_first = true -%}{%- else %}{{'\\n' + '<｜tool▁call▁begin｜>' + tool['type'] + '<｜tool▁sep｜>' + tool['function']['name'] + '\\n' + '```json' + '\\n' + tool['function']['arguments'] + '\\n' + '```' + '<｜tool▁call▁end｜>'}}{{'<｜tool▁calls▁end｜><｜end▁of▁sentence｜>'}}{%- endif %}{%- endfor %}{%- endif %}{%- if message['role'] == 'assistant' and message['content'] is not none %}{%- if ns.is_tool %}{{'<｜tool▁outputs▁end｜>' + message['content'] + '<｜end▁of▁sentence｜>'}}{%- set ns.is_tool = false -%}{%- else %}{% set content = message['content'] %}{{'<｜Assistant｜>' + content + '<｜end▁of▁sentence｜>'}}{%- endif %}{%- endif %}{%- if message['role'] == 'tool' %}{%- set ns.is_tool = true -%}{%- if ns.is_output_first %}{{'<｜tool▁outputs▁begin｜><｜tool▁output▁begin｜>' + message['content'] + '<｜tool▁output▁end｜>'}}{%- set ns.is_output_first = false %}{%- else %}{{'\\n<｜tool▁output▁begin｜>' + message['content'] + '<｜tool▁output▁end｜>'}}{%- endif %}{%- endif %}{%- endfor -%}{% if ns.is_tool %}{{'<｜tool▁outputs▁end｜>'}}{% endif %}{% if add_generation_prompt and not ns.is_tool %}{{'<｜Assistant｜>'}}{% endif %}"
-system_prompt: "You are a helpful AI Assistant, designed to provided well-reasoned and detailed responses. You FIRST think about the reasoning process as an internal monologue and then provide the user with the answer. The reasoning process MUST BE enclosed within <think> and </think> tags."
+system_prompt: "A conversation between User and Assistant. The User asks a question, and the Assistant solves it. The Assistant first thinks about the reasoning process in the mind and then provides the User with the answer. The reasoning process is enclosed within <think> </think> and answer is enclosed within <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think> <answer> answer here </answer>."
 
 # LORA config
 use_peft: true
 lora_task_type: CAUSAL_LM
-lora_r: 64
+lora_r: 256
 lora_alpha: 16
 lora_dropout: 0.05
 lora_target_modules:
@@ -35,7 +39,7 @@ lora_target_modules:
 
 warmup_ratio: 0.05
 optim: adamw_bnb_8bit
-gradient_accumulation_steps: 16
+gradient_accumulation_steps: 8
 learning_rate: 4.0e-5
 max_grad_norm: 1.0
 lr_scheduler_type: cosine_with_min_lr
@@ -46,24 +50,21 @@ num_generations: 8
 max_prompt_length: 512
 max_completion_length: 12288
 per_device_eval_batch_size: 4
-per_device_train_batch_size: 2
-num_train_epochs: 1
+per_device_train_batch_size: 4
+num_train_epochs: 2
 
 # GRPO trainer config
 reward_funcs:
 - accuracy
 - format
-- length
 vllm_config:
   enforce_eager: true
   gpu_memory_utilization: 0.5
-  tensor_parallel_size: 2
+  tensor_parallel_size: 1
   disable_log_stats: true
   sampling_params_dict:
     temperature: 0.6
-    top_p: 0.95
-    repetition_penalty: 1.05
-    min_p: 0.05
+    min_p: 0.01
 
 bf16: true
 
@@ -77,7 +78,10 @@ log_level: error
 logging_strategy: steps
 logging_steps: 1
 
-eval_strategy: "no"
+eval_strategy: "steps"
+eval_steps: 5
+metric_for_best_model: "eval_exact_match"
+greater_is_better: true
 
 max_steps: -1
 

@@ -475,7 +475,7 @@ class FastGRPOTrainer(Trainer):
                 metrics.update(dataset_metrics)
             for eval_dataset_name in eval_dataset.keys():
                 for metric_name in ["exact_match", "runtime", "steps"]:
-                    metrics[f"{metric_key_prefix}_{metric_name}"] = metrics.get(metric_name, 0) + metrics.pop(
+                    metrics[f"{metric_key_prefix}_{metric_name}"] = metrics.get(f"{metric_key_prefix}_{metric_name}", 0) + metrics.pop(
                         f"{metric_key_prefix}_{eval_dataset_name}_{metric_name}"
                     )
             return metrics
