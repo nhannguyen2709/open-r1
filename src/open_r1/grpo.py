@@ -17,7 +17,7 @@ import os
 from dataclasses import dataclass, field
 
 import torch
-from datasets import load_dataset
+from datasets import Dataset, load_dataset
 import datasets
 from transformers import set_seed
 from transformers.trainer import logger
@@ -163,9 +163,13 @@ def main(script_args, training_args, model_args):
 
     eval_dataset = None
     if training_args.eval_strategy != "no":
-        eval_dataset = load_dataset("Maxwell-Jia/AIME_2024", split="train")
-        eval_dataset = eval_dataset.rename_columns({"Problem": "problem", "Solution": "solution", "Answer": "answer"})
-        eval_dataset = eval_dataset.map(make_conversation)
+        eval_dataset = {
+            "reference": load_dataset("csv", data_files="reference.csv", split="train"),
+            "aime-2024": load_dataset("csv", data_files="aime-2024.csv", split="train"),
+            "aime-2025": load_dataset("csv", data_files="aime-2025.csv", split="train"),
+        }
+        for dataset_name, dataset in eval_dataset.items():
+            eval_dataset[dataset_name] = dataset.map(make_conversation)
 
     ################
     # Load tokenizer

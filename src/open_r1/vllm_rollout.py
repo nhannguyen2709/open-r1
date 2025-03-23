@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 import logging
 
 from accelerate import Accelerator
@@ -14,7 +15,6 @@ from vllm import LLM
 from vllm.distributed import parallel_state as vllm_ps
 
 from open_r1.configs import vLLMConfig
-from open_r1.performance import log_gpu_memory_usage
 from open_r1.deepspeed_utils import (
     offload_deepspeed_model_to_cpu,
     offload_deepspeed_optimizer,
@@ -70,9 +70,26 @@ class vLLMRollout:
         self.sampling_params = config.sampling_params
         self.pad_token_id = tokenizer.pad_token_id
 
+    @contextmanager
+    def update_sampling_params(self, **kwargs):
+        # update sampling params
+        old_sampling_params_args = {}
+        if kwargs:
+            for key, value in kwargs.items():
+                if hasattr(self.sampling_params, key):
+                    old_value = getattr(self.sampling_params, key)
+                    old_sampling_params_args[key] = old_value
+                    setattr(self.sampling_params, key, value)
+        yield
+        # roll back to previous sampling params
+        # if len(old_sampling_params_args):
+        for key, value in old_sampling_params_args.items():
+            setattr(self.sampling_params, key, value)
+
     @torch.no_grad()
     def generate_sequences(self, data: list[str], **kwargs) -> list[list[int]]:
-        outputs = self.inference_engine.generate(data, sampling_params=self.sampling_params, use_tqdm=False)
+        with self.update_sampling_params(**kwargs):
+            outputs = self.inference_engine.generate(data, sampling_params=self.sampling_params, use_tqdm=False)
 
         completion_ids = []
         for output in outputs:
@@ -116,7 +133,6 @@ class VLLMShardingManager:
 
         state_dict = {}
         if self.load_weights:
-            log_gpu_memory_usage("Before state_dict() in sharding manager memory", logger=logger)
             with unwrap_model_for_generation(
                 self.module,
                 self.accelerator,
@@ -143,8 +159,6 @@ class VLLMShardingManager:
 
             torch.cuda.empty_cache()
 
-            log_gpu_memory_usage("After state_dict() in sharding manager memory", logger=logger)
-
         self.inference_engine.wake_up()
         model = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
 
@@ -156,14 +170,11 @@ class VLLMShardingManager:
                 loaded_params.append(model.load_weights([(name, param)]))
             logger.info(f"vLLM load weights, loaded_params: {len(loaded_params)}")
 
-        log_gpu_memory_usage("After sync model weights in sharding manager", logger=logger)
         del state_dict
-        log_gpu_memory_usage("After del state_dict and empty_cache in sharding manager", logger=logger)
 
         offload_deepspeed_model_to_cpu(self.module)
         offload_deepspeed_optimizer(self.module.optimizer)
         torch.cuda.empty_cache()
-        log_gpu_memory_usage("After offload model weights in sharding manager", logger=logger)
 
         # important: need to manually set the random states of each tp to be identical.
         if self.device_mesh is not None:
@@ -171,9 +182,7 @@ class VLLMShardingManager:
             torch.cuda.set_rng_state(self.gen_random_states)
 
     def __exit__(self, exc_type, exc_val, traceback):
-        log_gpu_memory_usage("Before vllm offload in sharding manager", logger=logger)
         self.inference_engine.sleep(level=1)
-        log_gpu_memory_usage("After vllm offload in sharding manager", logger=logger)
 
         load_deepspeed_model_to_gpu(self.module)
         load_deepspeed_optimizer(self.module.optimizer, torch.cuda.current_device())

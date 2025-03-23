@@ -57,8 +57,8 @@ from transformers.trainer_callback import (
     ExportableState,
     PrinterCallback,
 )
-from transformers.trainer_utils import TrainOutput
-from transformers.trainer_pt_utils import get_model_param_count
+from transformers.trainer_utils import EvalLoopOutput, SaveStrategy, TrainerMemoryTracker, TrainOutput, speed_metrics
+from transformers.trainer_pt_utils import EvalLoopContainer, get_model_param_count
 from transformers.utils import is_accelerate_available, is_liger_kernel_available, is_peft_available
 from trl.data_utils import (
     apply_chat_template,
@@ -91,8 +91,7 @@ if is_wandb_available():
     import wandb
 
 from open_r1.configs import GRPOConfig
-from open_r1.grpo_loss import LigerFusedLinearGRPOLoss
-from open_r1.performance import log_gpu_memory_usage
+from open_r1.rewards import extract_boxed_text
 from open_r1.vllm_rollout import vLLMRollout, VLLMShardingManager
 
 
@@ -162,10 +161,6 @@ class FastGRPOTrainer(Trainer):
                     "This argument can only be used when the `model` argument is a string."
                 )
 
-        # Enable gradient checkpointing if requested
-        if args.gradient_checkpointing:
-            model = self._enable_gradient_checkpointing(model, args)
-
         # Processing class
         if processing_class is None:
             processing_class = AutoTokenizer.from_pretrained(model.config._name_or_path, padding_side="left")
@@ -210,12 +205,6 @@ class FastGRPOTrainer(Trainer):
                 reward_processing_classes[i] = reward_processing_class
         self.reward_processing_classes = reward_processing_classes
 
-        # Data collator
-        def data_collator(features):  # No data collation is needed in GRPO
-            return features
-
-        self.data_collator = data_collator
-
         # Training arguments
         self.max_prompt_length = args.max_prompt_length
         self.max_completion_length = args.max_completion_length  # = |o_i| in the GRPO paper
@@ -238,8 +227,18 @@ class FastGRPOTrainer(Trainer):
         self.optimizer_cls_and_kwargs = None  # needed for transformers >= 4.47
         self.create_accelerator_and_postprocess()
 
+        # memory metrics - must set up as early as possible
+        self._memory_tracker = TrainerMemoryTracker(self.args.skip_memory_metrics)
+        self._memory_tracker.start()
+
+        # Data collator
+        def data_collator(features):  # No data collation is needed in GRPO
+            return features
+
         set_seed(args.seed, device_specific=True)
+        self.data_collator = data_collator
         self.train_dataset = train_dataset
+        self.eval_dataset = eval_dataset
         self.dataloader = DataLoader(
             self.train_dataset,
             batch_size=self.local_dataloader_batch_size,
@@ -264,12 +263,10 @@ class FastGRPOTrainer(Trainer):
             os.makedirs(self.args.output_dir, exist_ok=True)
         self.backup_model = None
 
-        # # Build actor model + optimizer, reference model
-        # if is_deepspeed_zero3_enabled() and peft_config is not None:
-        #     raise ValueError(
-        #         "PEFT (Parameter-Efficient Fine-Tuning) is not supported with DeepSpeed ZeRO-3. "
-        #         "Please disable DeepSpeed ZeRO-3 or use a different training configuration without PEFT."
-        #     )
+        # Enable gradient checkpointing if requested
+        if args.gradient_checkpointing:
+            model = self._enable_gradient_checkpointing(model, args)
+
         if peft_config is not None:
             model = get_peft_model(model, peft_config)
 
@@ -330,18 +327,37 @@ class FastGRPOTrainer(Trainer):
         else:
             rollout_device_mesh = None
 
-        log_gpu_memory_usage("Before building vllm rollout", logger=logger)
         self.rollout = vLLMRollout(model_id, self.args.vllm_config, self.processing_class)
         logger.info(f"Sampling params: {self.args.vllm_config.sampling_params}")
-        log_gpu_memory_usage("After building vllm rollout", logger=logger)
         self.rollout_sharding_manager = VLLMShardingManager(
             self.model, self.rollout.inference_engine, self.accelerator, model.config, device_mesh=rollout_device_mesh
         )
-        log_gpu_memory_usage("After building vllm sharding manager", logger=logger)
+
+        self._memory_tracker.stop_and_update_metrics()
         self._last_loaded_step = 0
         self.accelerator.wait_for_everyone()
 
         self.log_completions = args.log_completions
+
+    def _enable_gradient_checkpointing(self, model: PreTrainedModel, args: GRPOConfig) -> PreTrainedModel:
+        """Enables gradient checkpointing for the model."""
+        # Ensure use_cache is disabled
+        model.config.use_cache = False
+
+        # Enable gradient checkpointing on the base model for PEFT
+        if is_peft_model(model):
+            model.base_model.gradient_checkpointing_enable()
+        # Enable gradient checkpointing for non-PEFT models
+        else:
+            model.gradient_checkpointing_enable()
+
+        gradient_checkpointing_kwargs = args.gradient_checkpointing_kwargs or {}
+        use_reentrant = "use_reentrant" not in gradient_checkpointing_kwargs or gradient_checkpointing_kwargs["use_reentrant"]
+
+        if use_reentrant:
+            model.enable_input_require_grads()
+
+        return model
 
     # Get the per-token log probabilities for the completions for the model and the reference model
     def _get_per_token_logps(self, model, input_ids, attention_mask, logits_to_keep):
@@ -359,6 +375,7 @@ class FastGRPOTrainer(Trainer):
         logits = logits[:, -logits_to_keep:]
         return selective_log_softmax(logits, input_ids)  #  compute logprobs for the input tokens
 
+    @profiling_decorator
     @torch.no_grad()
     def prepare_batch(self, batch):
         """
@@ -367,6 +384,8 @@ class FastGRPOTrainer(Trainer):
         - compute ref logprobs for each generation
         - using internal reward model(s) to get rewards
         """
+        self._memory_tracker.start()
+
         prompts = [x["prompt"] for x in batch]
         prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in batch]
         prompt_inputs = self.processing_class(prompts_text, add_special_tokens=False)
@@ -381,16 +400,9 @@ class FastGRPOTrainer(Trainer):
 
         load_weights = self.state.global_step != self._last_loaded_step
         self.rollout_sharding_manager.load_weights = load_weights
-        start = time.time()
         with self.rollout_sharding_manager:
-            log_gpu_memory_usage("After entering rollout sharding manager", logger=logger)
-
             all_prompts_text = self.rollout_sharding_manager.preprocess_data(all_prompts_text)
             completion_ids = self.rollout.generate_sequences(all_prompts_text)
-
-            log_gpu_memory_usage("After rollout generation", logger=logger)
-            logger.info(f"Rollout generation time: {time.time() - start:.2f}s")
-
             completion_ids = self.rollout_sharding_manager.postprocess_data(completion_ids)
         self._last_loaded_step = self.state.global_step
 
@@ -444,12 +456,100 @@ class FastGRPOTrainer(Trainer):
         # sort examples by length of prompt_ids and completion_ids
         examples.sort(key=lambda x: len(x["prompt_ids"]) + len(x["completion_ids"]))
 
+        self._memory_tracker.stop_and_update_metrics()
         return examples
+
+    def evaluate(
+        self, eval_dataset: Optional[Dataset] = None, ignore_keys: Optional[list[str]] = None, metric_key_prefix: str = "eval"
+    ) -> dict[str, float]:
+        override = eval_dataset is not None
+        eval_dataset = eval_dataset if override else self.eval_dataset
+        if isinstance(eval_dataset, dict):
+            metrics = {}
+            for eval_dataset_name, _eval_dataset in eval_dataset.items():
+                dataset_metrics = self.evaluate(
+                    eval_dataset=_eval_dataset if override else eval_dataset_name,
+                    ignore_keys=ignore_keys,
+                    metric_key_prefix=f"{metric_key_prefix}_{eval_dataset_name}",
+                )
+                metrics.update(dataset_metrics)
+            for eval_dataset_name in eval_dataset.keys():
+                for metric_name in ["exact_match", "runtime", "steps"]:
+                    metrics[f"{metric_key_prefix}_{metric_name}"] = metrics.get(metric_name, 0) + metrics.pop(
+                        f"{metric_key_prefix}_{eval_dataset_name}_{metric_name}"
+                    )
+            return metrics
+
+        # memory metrics - must set up as early as possible
+        self._memory_tracker.start()
+
+        eval_dataloader = self.get_eval_dataloader(eval_dataset)
+        start_time = time.time()
+        # Eval loop
+        args = self.args
+        logger.info(f"\n***** Running evaluation *****")
+        logger.info(f"  Num examples = {self.num_examples(eval_dataloader)}")
+        logger.info(f"  Batch size = {self.args.eval_batch_size}")
+
+        self.callback_handler.eval_dataloader = eval_dataloader
+        all_preds = []
+        all_labels = []
+        with self.rollout_sharding_manager:
+            for step, batch in enumerate(eval_dataloader):
+                prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in batch]
+                all_prompts_text = self.rollout_sharding_manager.preprocess_data(prompts_text)
+                # Greedy decoding
+                completion_ids = self.rollout.generate_sequences(all_prompts_text, temperature=0.0, stop="</think>")
+                completion_ids = self.rollout_sharding_manager.postprocess_data(completion_ids)
+                completion_ids = self.gather_function((completion_ids), use_gather_object=True)
+                all_preds.extend(completion_ids)
+                # Convert ground truth answer to string
+                labels = [str(example["answer"]) for example in batch]
+                labels = self.gather_function((labels), use_gather_object=True)
+                all_labels.extend(labels)
+
+                self.control = self.callback_handler.on_prediction_step(args, self.state, self.control)
+
+        decoded_preds = self.processing_class.batch_decode(all_preds, skip_special_tokens=True)
+        output = EvalLoopOutput(predictions=all_preds, label_ids=all_labels, metrics={}, num_samples=len(all_labels))
+
+        # Metrics !
+        exact_match = 0
+        for pred, label in zip(decoded_preds, all_labels):
+            parsed_pred = extract_boxed_text(pred)
+            if parsed_pred == label:
+                exact_match += 1
+
+        output.metrics[f"{metric_key_prefix}_exact_match"] = exact_match
+        output.metrics[f"{metric_key_prefix}_accuracy"] = exact_match / len(all_labels)
+        output.metrics[f"{metric_key_prefix}_steps"] = math.ceil(len(all_labels) / self.args.eval_batch_size)
+
+        total_batch_size = self.args.eval_batch_size * self.args.world_size
+
+        output.metrics.update(
+            speed_metrics(
+                metric_key_prefix,
+                start_time,
+                num_samples=len(all_labels),
+                num_steps=math.ceil(len(all_labels) / total_batch_size),
+            )
+        )
+        self.log(output.metrics)
+        self.control = self.callback_handler.on_evaluate(self.args, self.state, self.control, output.metrics)
+
+        self._memory_tracker.stop_and_update_metrics(output.metrics)
+        return output.metrics
 
     def train(
         self,
         resume_from_checkpoint: Optional[Union[str, bool]] = None,
     ):
+        if resume_from_checkpoint is False:
+            resume_from_checkpoint = None
+
+        # memory metrics - must set up as early as possible
+        self._memory_tracker.start()
+
         self.callback_handler = CallbackHandler(
             self.callbacks,
             self.model,
@@ -465,18 +565,8 @@ class FastGRPOTrainer(Trainer):
             stateful_callbacks=[cb for cb in self.callback_handler.callbacks + [self.control] if isinstance(cb, ExportableState)],
         )
 
-        if self.args.logging_steps is not None:
-            if self.args.logging_steps < 1:
-                self.state.logging_steps = math.ceil(self.state.max_steps * self.args.logging_steps)
-            else:
-                self.state.logging_steps = self.args.logging_steps
-
-        if self.args.save_steps is not None:
-            if self.args.save_steps < 1:
-                self.state.save_steps = math.ceil(self.state.max_steps * self.args.save_steps)
-            else:
-                self.state.save_steps = self.args.save_steps
-
+        # Compute absolute values for logging, eval, and save if given as ratio
+        self.state.compute_steps(self.args, self.total_steps_per_device)
         self.state.max_steps = self.total_steps_per_device
         self.state.num_train_epochs = self.args.num_train_epochs
 
@@ -601,6 +691,14 @@ class FastGRPOTrainer(Trainer):
             self.log(metrics, start_time)
 
             self.control = self.callback_handler.on_step_end(self.args, self.state, self.control)
+
+            metrics = None
+            if self.control.should_evaluate:
+                metrics = self.evaluate(self.eval_dataset)
+                is_new_best_metric = self._determine_best_metric(metrics=metrics, trial=None)
+                if self.args.save_strategy == SaveStrategy.BEST:
+                    self.control.should_save = is_new_best_metric
+
             if self.control.should_save:
                 self._save_checkpoint(self.model, trial=None)
                 self.control = self.callback_handler.on_save(self.args, self.state, self.control)
@@ -610,31 +708,29 @@ class FastGRPOTrainer(Trainer):
             self._save_checkpoint(self.model, trial=None, metrics=None)
             self.control = self.callback_handler.on_save(self.args, self.state, self.control)
 
+        effective_global_step = max(self.state.global_step, 0.001)  # Avoid ZeroDivisionError
+        train_loss = self._total_loss_scalar / effective_global_step
+
+        metrics = speed_metrics(
+            "train",
+            start_time,
+            num_samples=self.train_dataset_len,
+            num_steps=self.state.max_steps,
+            # num_tokens=num_train_tokens,
+        )
+        self.store_flos()
+        metrics["total_flos"] = self.state.total_flos
+        metrics["train_loss"] = train_loss
+
+        self._memory_tracker.stop_and_update_metrics(metrics)
+
+        self.log(metrics)
+
         return TrainOutput(
             self.state.global_step,
             tr_loss.item() / self.state.global_step if self.state.global_step > 0 else 0.0,
             {k: sum(v) / len(v) if v else 0.0 for k, v in self._metrics["train"].items()},
         )
-
-    def _enable_gradient_checkpointing(self, model: PreTrainedModel, args: GRPOConfig) -> PreTrainedModel:
-        """Enables gradient checkpointing for the model."""
-        # Ensure use_cache is disabled
-        model.config.use_cache = False
-
-        # Enable gradient checkpointing on the base model for PEFT
-        if is_peft_model(model):
-            model.base_model.gradient_checkpointing_enable()
-        # Enable gradient checkpointing for non-PEFT models
-        else:
-            model.gradient_checkpointing_enable()
-
-        gradient_checkpointing_kwargs = args.gradient_checkpointing_kwargs or {}
-        use_reentrant = "use_reentrant" not in gradient_checkpointing_kwargs or gradient_checkpointing_kwargs["use_reentrant"]
-
-        if use_reentrant:
-            model.enable_input_require_grads()
-
-        return model
 
     def _optimization_step(self, mini_batch: dict[str, torch.Tensor | list[str]], idx: int, iteration: int):
         device = self.accelerator.device

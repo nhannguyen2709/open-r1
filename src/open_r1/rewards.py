@@ -184,7 +184,7 @@ def len_reward(completions: list[Dict[str, str]], solutions: list[str], **kwargs
         if len(gold_parsed) == 0:
             # Skip unparseable examples
             correctness.append(True)  # Treat as correct to avoid penalizing
-            print("Failed to parse gold solution: ", sol)
+            # print("Failed to parse gold solution: ", sol)
             continue
 
         answer_parsed = parse(
