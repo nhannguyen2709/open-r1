@@ -38,7 +38,9 @@ answer_parser = partial(
     ],
     extraction_mode="first_match",
 )
-solution_parser = partial(parse, extraction_config=[LatexExtractionConfig()], extraction_mode="first_match")
+solution_parser = partial(
+    parse, extraction_config=[LatexExtractionConfig()], extraction_mode="first_match"
+)
 
 
 # def accuracy_reward(completions, answer, **kwargs):
@@ -157,7 +159,7 @@ def reasoning_steps_reward(completions, **kwargs):
     return [min(1.0, count / 3) for count in matches]
 
 
-def len_reward(completions: list[Dict[str, str]], solutions: list[str], **kwargs) -> float:
+def len_reward(completions: list[Dict[str, str]], answer: list[str], **kwargs) -> float:
     """Compute length-based rewards to discourage overthinking and promote token efficiency.
 
     Taken from from the Kimi 1.5 tech report: https://arxiv.org/abs/2501.12599
@@ -175,17 +177,17 @@ def len_reward(completions: list[Dict[str, str]], solutions: list[str], **kwargs
 
     # First check correctness of answers
     correctness = []
-    for content, sol in zip(contents, solutions):
-        gold_parsed = parse(
-            sol,
-            extraction_mode="first_match",
-            extraction_config=[LatexExtractionConfig()],
-        )
-        if len(gold_parsed) == 0:
-            # Skip unparseable examples
-            correctness.append(True)  # Treat as correct to avoid penalizing
-            # print("Failed to parse gold solution: ", sol)
-            continue
+    for content, gold_parsed in zip(contents, answer):
+        # gold_parsed = parse(
+        #     sol,
+        #     extraction_mode="first_match",
+        #     extraction_config=[LatexExtractionConfig()],
+        # )
+        # if len(gold_parsed) == 0:
+        #     # Skip unparseable examples
+        #     correctness.append(True)  # Treat as correct to avoid penalizing
+        #     # print("Failed to parse gold solution: ", sol)
+        #     continue
 
         answer_parsed = parse(
             content,
@@ -395,7 +397,9 @@ def code_reward(completions, **kwargs) -> list[float]:
 
         evaluate_code(code_snippet, test_cases)
         """
-        code_snippets = [extract_code(completion[-1]["content"]) for completion in completions]
+        code_snippets = [
+            extract_code(completion[-1]["content"]) for completion in completions
+        ]
         verification_info = kwargs["verification_info"]
         scripts = [
             evaluation_script_template.format(
@@ -424,11 +428,16 @@ def get_code_format_reward(language: str = "python"):
     Args:
         language: Programming language supported by E2B https://e2b.dev/docs/code-interpreting/supported-languages
     """
-    pattern = rf"^<think>\n.*?\n</think>\n<answer>\n.*?```{language}.*?```.*?\n</answer>$"
+    pattern = (
+        rf"^<think>\n.*?\n</think>\n<answer>\n.*?```{language}.*?```.*?\n</answer>$"
+    )
 
     def code_format_reward(completions, **kwargs):
         completion_contents = [completion[0]["content"] for completion in completions]
-        matches = [re.match(pattern, content, re.DOTALL | re.MULTILINE) for content in completion_contents]
+        matches = [
+            re.match(pattern, content, re.DOTALL | re.MULTILINE)
+            for content in completion_contents
+        ]
         return [1.0 if match else 0.0 for match in matches]
 
     return code_format_reward

@@ -28,16 +28,35 @@ class vLLMConfig:
     """
 
     dtype: str = field(default="bfloat16", metadata={"help": "The data type to use."})
-    enable_chunked_prefill: bool = field(default=False, metadata={"help": "Whether to enable chunked prefill."})
-    max_num_batched_tokens: int = field(default=8192, metadata={"help": "The maximum number of tokens to batch."})
-    max_model_len: int = field(default=8192, metadata={"help": "The maximum model length."})
-    enforce_eager: bool = field(default=False, metadata={"help": "Whether to enforce eager execution."})
-    enable_prefix_caching: bool = field(default=False, metadata={"help": "Whether to enable prefix caching."})
-    tensor_parallel_size: int = field(default=1, metadata={"help": "The number of tensor parallel size."})
-    gpu_memory_utilization: float = field(default=0.6, metadata={"help": "The GPU memory utilization."})
-    disable_log_stats: bool = field(default=False, metadata={"help": "Whether to disable log stats."})
+    enable_chunked_prefill: bool = field(
+        default=False, metadata={"help": "Whether to enable chunked prefill."}
+    )
+    max_num_batched_tokens: int = field(
+        default=8192, metadata={"help": "The maximum number of tokens to batch."}
+    )
+    max_model_len: int = field(
+        default=8192, metadata={"help": "The maximum model length."}
+    )
+    enforce_eager: bool = field(
+        default=False, metadata={"help": "Whether to enforce eager execution."}
+    )
+    enable_prefix_caching: bool = field(
+        default=False, metadata={"help": "Whether to enable prefix caching."}
+    )
+    tensor_parallel_size: int = field(
+        default=1, metadata={"help": "The number of tensor parallel size."}
+    )
+    gpu_memory_utilization: float = field(
+        default=0.6, metadata={"help": "The GPU memory utilization."}
+    )
+    disable_log_stats: bool = field(
+        default=False, metadata={"help": "Whether to disable log stats."}
+    )
     sampling_params_dict: dict = field(
-        default_factory=lambda: {}, metadata={"help": "Dictionary of sampling parameters to initialize SamplingParams."}
+        default_factory=lambda: {},
+        metadata={
+            "help": "Dictionary of sampling parameters to initialize SamplingParams."
+        },
     )
 
     @property
@@ -73,7 +92,9 @@ class GRPOConfig(TrainingArguments):
     )
     max_prompt_length: Optional[int] = field(
         default=512,
-        metadata={"help": "Maximum length of the prompt. If the prompt is longer than this value, it will be truncated left."},
+        metadata={
+            "help": "Maximum length of the prompt. If the prompt is longer than this value, it will be truncated left."
+        },
     )
     num_generations: Optional[int] = field(
         default=8,
@@ -109,7 +130,10 @@ class GRPOConfig(TrainingArguments):
     # Parameters that control the training
     beta: float = field(
         default=0.04,
-        metadata={"help": "KL coefficient. If `0.0`, the reference model is not loaded, reducing memory usage and improving " "training speed."},
+        metadata={
+            "help": "KL coefficient. If `0.0`, the reference model is not loaded, reducing memory usage and improving "
+            "training speed."
+        },
     )
     reward_weights: Optional[list[float]] = field(
         default=None,
@@ -154,22 +178,32 @@ class GRPOConfig(TrainingArguments):
         default_factory=lambda: [],
         metadata={"help": "The callbacks to run during training."},
     )
-    chat_template: Optional[str] = field(default=None, metadata={"help": "The chat template to use."})
+    chat_template: Optional[str] = field(
+        default=None, metadata={"help": "The chat template to use."}
+    )
     system_prompt: Optional[str] = field(
         default=None,
         metadata={"help": "The optional system prompt to use."},
     )
-    hub_model_revision: Optional[str] = field(default="main", metadata={"help": "The Hub model branch to push the model to."})
-    overwrite_hub_revision: bool = field(default=False, metadata={"help": "Whether to overwrite the Hub revision."})
+    hub_model_revision: Optional[str] = field(
+        default="main", metadata={"help": "The Hub model branch to push the model to."}
+    )
+    overwrite_hub_revision: bool = field(
+        default=False, metadata={"help": "Whether to overwrite the Hub revision."}
+    )
     num_iterations: int = field(
         default=1,
-        metadata={"help": "Number of iterations per batch (denoted as μ in the algorithm)."},
+        metadata={
+            "help": "Number of iterations per batch (denoted as μ in the algorithm)."
+        },
     )
     epsilon: float = field(
         default=0.2,
         metadata={"help": "Epsilon value for clipping."},
     )
-    push_to_hub_revision: bool = field(default=False, metadata={"help": "Whether to push to a Hub revision/branch."})
+    push_to_hub_revision: bool = field(
+        default=False, metadata={"help": "Whether to push to a Hub revision/branch."}
+    )
     wandb_entity: Optional[str] = field(
         default=None,
         metadata={"help": ("The entity to store runs under.")},
@@ -178,7 +212,9 @@ class GRPOConfig(TrainingArguments):
         default=None,
         metadata={"help": ("The project to store runs under.")},
     )
-    vllm_config: vLLMConfig = field(default_factory=vLLMConfig, metadata={"help": "The vLLM configuration."})
+    vllm_config: vLLMConfig = field(
+        default_factory=vLLMConfig, metadata={"help": "The vLLM configuration."}
+    )
 
     def __post_init__(self):
         super().__post_init__()
@@ -193,10 +229,18 @@ class GRPOConfig(TrainingArguments):
 
             # Handle nested sampling_params_dict specially
             if "sampling_params_dict" in self.vllm_config:
-                config_dict["sampling_params_dict"] = self.vllm_config["sampling_params_dict"]
-                config_dict["sampling_params_dict"]["max_tokens"] = self.max_completion_length
-                config_dict["max_model_len"] = self.max_prompt_length + self.max_completion_length
-                config_dict["max_num_batched_tokens"] = self.max_prompt_length + self.max_completion_length
+                config_dict["sampling_params_dict"] = self.vllm_config[
+                    "sampling_params_dict"
+                ]
+                config_dict["sampling_params_dict"][
+                    "max_tokens"
+                ] = self.max_completion_length
+                config_dict["max_model_len"] = (
+                    self.max_prompt_length + self.max_completion_length
+                )
+                config_dict["max_num_batched_tokens"] = (
+                    self.max_prompt_length + self.max_completion_length
+                )
 
             # Create a new vLLMConfig with the merged values
             self.vllm_config = vLLMConfig(**config_dict)
@@ -216,8 +260,12 @@ class SFTConfig(trl.SFTConfig):
         default_factory=lambda: [],
         metadata={"help": "The callbacks to run during training."},
     )
-    chat_template: Optional[str] = field(default=None, metadata={"help": "The chat template to use."})
-    chat_template: Optional[str] = field(default=None, metadata={"help": "The chat template to use."})
+    chat_template: Optional[str] = field(
+        default=None, metadata={"help": "The chat template to use."}
+    )
+    chat_template: Optional[str] = field(
+        default=None, metadata={"help": "The chat template to use."}
+    )
     system_prompt: Optional[str] = field(
         default=None,
         metadata={"help": "The optional system prompt to use."},
@@ -226,8 +274,12 @@ class SFTConfig(trl.SFTConfig):
         default="main",
         metadata={"help": "The Hub model branch to push the model to."},
     )
-    overwrite_hub_revision: bool = field(default=False, metadata={"help": "Whether to overwrite the Hub revision."})
-    push_to_hub_revision: bool = field(default=False, metadata={"help": "Whether to push to a Hub revision/branch."})
+    overwrite_hub_revision: bool = field(
+        default=False, metadata={"help": "Whether to overwrite the Hub revision."}
+    )
+    push_to_hub_revision: bool = field(
+        default=False, metadata={"help": "Whether to push to a Hub revision/branch."}
+    )
     wandb_entity: Optional[str] = field(
         default=None,
         metadata={"help": ("The entity to store runs under.")},

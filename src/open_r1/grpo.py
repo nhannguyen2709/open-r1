@@ -16,6 +16,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 
+from accelerate.state import PartialState
 import torch
 from datasets import Dataset, load_dataset
 import datasets
@@ -103,7 +104,9 @@ class GRPOScriptArguments(ScriptArguments):
     )
     repetition_max_penalty: float = field(
         default=-1.0,
-        metadata={"help": "Maximum (negative) penalty for for repetition penalty reward"},
+        metadata={
+            "help": "Maximum (negative) penalty for for repetition penalty reward"
+        },
     )
 
 
@@ -149,7 +152,8 @@ def main(script_args, training_args, model_args):
         prompt.append(
             {
                 "role": "user",
-                "content": example["problem"] + "\nPlease put the final answer within \\boxed{}.",
+                "content": example["problem"]
+                + "\nPlease put the final answer within \\boxed{}.",
             }
         )
         return {"prompt": prompt}
@@ -158,8 +162,11 @@ def main(script_args, training_args, model_args):
     # Load the dataset
     ################
     # train_dataset = load_dataset(script_args.dataset_name, split=script_args.dataset_train_split)
-    train_dataset = load_dataset("parquet", data_files="/home/andy/data/r1-hard-e2h.parquet", split="train")
-    train_dataset = train_dataset.map(make_conversation)
+    train_dataset = load_dataset(
+        "parquet", data_files="/home/andy/data/r1-hard-e2h.parquet", split="train"
+    )
+    with PartialState().main_process_first():
+        train_dataset = train_dataset.map(make_conversation, num_proc=8)
 
     eval_dataset = None
     if training_args.eval_strategy != "no":
@@ -200,7 +207,11 @@ def main(script_args, training_args, model_args):
     reward_funcs = [REWARD_FUNCS_REGISTRY[func] for func in script_args.reward_funcs]
 
     logger.info("*** Initializing model kwargs ***")
-    torch_dtype = model_args.torch_dtype if model_args.torch_dtype in ["auto", None] else getattr(torch, model_args.torch_dtype)
+    torch_dtype = (
+        model_args.torch_dtype
+        if model_args.torch_dtype in ["auto", None]
+        else getattr(torch, model_args.torch_dtype)
+    )
     quantization_config = get_quantization_config(model_args)
     model_kwargs = dict(
         revision=model_args.model_revision,

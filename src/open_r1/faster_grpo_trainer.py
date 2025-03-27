@@ -57,9 +57,19 @@ from transformers.trainer_callback import (
     ExportableState,
     PrinterCallback,
 )
-from transformers.trainer_utils import EvalLoopOutput, SaveStrategy, TrainerMemoryTracker, TrainOutput, speed_metrics
+from transformers.trainer_utils import (
+    EvalLoopOutput,
+    SaveStrategy,
+    TrainerMemoryTracker,
+    TrainOutput,
+    speed_metrics,
+)
 from transformers.trainer_pt_utils import EvalLoopContainer, get_model_param_count
-from transformers.utils import is_accelerate_available, is_liger_kernel_available, is_peft_available
+from transformers.utils import (
+    is_accelerate_available,
+    is_liger_kernel_available,
+    is_peft_available,
+)
 from trl.data_utils import (
     apply_chat_template,
     is_conversational,
@@ -102,7 +112,9 @@ logger = logging.getLogger(__name__)
 def exact_div(a: int, b: int, custom_error_message: str = "") -> int:
     q = a // b
     if a != q * b:
-        raise ValueError(f"{custom_error_message}, inexact division: {a} / {b} = {a / b}")
+        raise ValueError(
+            f"{custom_error_message}, inexact division: {a} / {b} = {a / b}"
+        )
     return q
 
 
@@ -115,11 +127,17 @@ class FastGRPOTrainer(Trainer):
         reward_funcs: Union[RewardFunc, list[RewardFunc]],
         args: GRPOConfig = None,
         train_dataset: Optional[Union[Dataset, IterableDataset]] = None,
-        eval_dataset: Optional[Union[Dataset, IterableDataset, dict[str, Union[Dataset, IterableDataset]]]] = None,
+        eval_dataset: Optional[
+            Union[Dataset, IterableDataset, dict[str, Union[Dataset, IterableDataset]]]
+        ] = None,
         processing_class: Optional[PreTrainedTokenizerBase] = None,
-        reward_processing_classes: Optional[Union[PreTrainedTokenizerBase, list[PreTrainedTokenizerBase]]] = None,
+        reward_processing_classes: Optional[
+            Union[PreTrainedTokenizerBase, list[PreTrainedTokenizerBase]]
+        ] = None,
         callbacks: Optional[list[TrainerCallback]] = None,
-        optimizers: tuple[Optional[torch.optim.Optimizer], Optional[torch.optim.lr_scheduler.LambdaLR]] = (None, None),
+        optimizers: tuple[
+            Optional[torch.optim.Optimizer], Optional[torch.optim.lr_scheduler.LambdaLR]
+        ] = (None, None),
         peft_config: Optional["PeftConfig"] = None,
     ):
         self.args = args
@@ -128,7 +146,8 @@ class FastGRPOTrainer(Trainer):
         if args.reward_weights is not None:
             if len(args.reward_weights) != len(reward_funcs):
                 raise ValueError(
-                    f"Number of reward weights ({len(args.reward_weights)}) must match number of reward " f"functions ({len(reward_funcs)})"
+                    f"Number of reward weights ({len(args.reward_weights)}) must match number of reward "
+                    f"functions ({len(reward_funcs)})"
                 )
             self.reward_weights = args.reward_weights
         else:
@@ -140,7 +159,11 @@ class FastGRPOTrainer(Trainer):
         if isinstance(model, str):
             model_id = model
             torch_dtype = model_init_kwargs.get("torch_dtype")
-            if isinstance(torch_dtype, torch.dtype) or torch_dtype == "auto" or torch_dtype is None:
+            if (
+                isinstance(torch_dtype, torch.dtype)
+                or torch_dtype == "auto"
+                or torch_dtype is None
+            ):
                 pass  # torch_dtype is already a torch.dtype or "auto" or None
             elif isinstance(torch_dtype, str):  # it's a str, but not "auto"
                 torch_dtype = getattr(torch, torch_dtype)
@@ -151,7 +174,11 @@ class FastGRPOTrainer(Trainer):
                     f"a `torch.dtype` (e.g., 'float32'), but got {torch_dtype}."
                 )
             # Disable caching if gradient checkpointing is enabled (not supported)
-            model_init_kwargs["use_cache"] = False if args.gradient_checkpointing else model_init_kwargs.get("use_cache")
+            model_init_kwargs["use_cache"] = (
+                False
+                if args.gradient_checkpointing
+                else model_init_kwargs.get("use_cache")
+            )
             model = AutoModelForCausalLM.from_pretrained(model_id, **model_init_kwargs)
         else:
             model_id = model.config._name_or_path
@@ -163,7 +190,9 @@ class FastGRPOTrainer(Trainer):
 
         # Processing class
         if processing_class is None:
-            processing_class = AutoTokenizer.from_pretrained(model.config._name_or_path, padding_side="left")
+            processing_class = AutoTokenizer.from_pretrained(
+                model.config._name_or_path, padding_side="left"
+            )
         self.processing_class = processing_class
 
         # Reward functions
@@ -171,14 +200,17 @@ class FastGRPOTrainer(Trainer):
             reward_funcs = [reward_funcs]
         for i, reward_func in enumerate(reward_funcs):
             if isinstance(reward_func, str):
-                reward_funcs[i] = AutoModelForSequenceClassification.from_pretrained(reward_func, num_labels=1, **model_init_kwargs)
+                reward_funcs[i] = AutoModelForSequenceClassification.from_pretrained(
+                    reward_func, num_labels=1, **model_init_kwargs
+                )
         self.reward_funcs = reward_funcs
 
         # Reward weights
         if args.reward_weights is not None:
             if len(args.reward_weights) != len(reward_funcs):
                 raise ValueError(
-                    f"Number of reward weights ({len(args.reward_weights)}) must match number of reward " f"functions ({len(reward_funcs)})"
+                    f"Number of reward weights ({len(args.reward_weights)}) must match number of reward "
+                    f"functions ({len(reward_funcs)})"
                 )
             self.reward_weights = torch.tensor(args.reward_weights, dtype=torch.float32)
         else:
@@ -191,14 +223,22 @@ class FastGRPOTrainer(Trainer):
             reward_processing_classes = [reward_processing_classes]
         else:
             if len(reward_processing_classes) != len(reward_funcs):
-                raise ValueError("The number of reward processing classes must match the number of reward functions.")
+                raise ValueError(
+                    "The number of reward processing classes must match the number of reward functions."
+                )
 
-        for i, (reward_processing_class, reward_func) in enumerate(zip(reward_processing_classes, reward_funcs)):
+        for i, (reward_processing_class, reward_func) in enumerate(
+            zip(reward_processing_classes, reward_funcs)
+        ):
             if isinstance(reward_func, PreTrainedModel):
                 if reward_processing_class is None:
-                    reward_processing_class = AutoTokenizer.from_pretrained(reward_func.config._name_or_path)
+                    reward_processing_class = AutoTokenizer.from_pretrained(
+                        reward_func.config._name_or_path
+                    )
                 if reward_processing_class.pad_token_id is None:
-                    reward_processing_class.pad_token = reward_processing_class.eos_token
+                    reward_processing_class.pad_token = (
+                        reward_processing_class.eos_token
+                    )
                 # The reward model computes the reward for the latest non-padded token in the input sequence.
                 # So it's important to set the pad token ID to the padding token ID of the processing class.
                 reward_func.config.pad_token_id = reward_processing_class.pad_token_id
@@ -207,7 +247,9 @@ class FastGRPOTrainer(Trainer):
 
         # Training arguments
         self.max_prompt_length = args.max_prompt_length
-        self.max_completion_length = args.max_completion_length  # = |o_i| in the GRPO paper
+        self.max_completion_length = (
+            args.max_completion_length
+        )  # = |o_i| in the GRPO paper
         self.num_generations = args.num_generations  # = G in the GRPO paper
         self.use_vllm = args.use_vllm
 
@@ -247,12 +289,22 @@ class FastGRPOTrainer(Trainer):
         )
         self.train_dataset_len = len(self.train_dataset)
         num_total_samples = int(self.args.num_train_epochs * self.train_dataset_len)
-        self.total_steps_per_device = num_total_samples // (self.local_dataloader_batch_size * self.accelerator.num_processes)
+        self.total_steps_per_device = num_total_samples // (
+            self.local_dataloader_batch_size * self.accelerator.num_processes
+        )
 
-        default_callbacks = DEFAULT_CALLBACKS + get_reporting_integration_callbacks(self.args.report_to)
-        self.callbacks = default_callbacks if callbacks is None else default_callbacks + callbacks
-        self.is_deepspeed_enabled = getattr(self.accelerator.state, "deepspeed_plugin", None) is not None
-        self.is_fsdp_enabled = getattr(self.accelerator.state, "fsdp_plugin", None) is not None
+        default_callbacks = DEFAULT_CALLBACKS + get_reporting_integration_callbacks(
+            self.args.report_to
+        )
+        self.callbacks = (
+            default_callbacks if callbacks is None else default_callbacks + callbacks
+        )
+        self.is_deepspeed_enabled = (
+            getattr(self.accelerator.state, "deepspeed_plugin", None) is not None
+        )
+        self.is_fsdp_enabled = (
+            getattr(self.accelerator.state, "fsdp_plugin", None) is not None
+        )
         self.current_flos = 0
         self.hp_search_backend = None
         # Create distant repo and output directory if needed
@@ -276,7 +328,9 @@ class FastGRPOTrainer(Trainer):
             # If beta is 0.0, the reference model is not needed
             self.ref_model = None
         elif is_deepspeed_zero3_enabled():
-            self.ref_model = AutoModelForCausalLM.from_pretrained(model_id, **model_init_kwargs)
+            self.ref_model = AutoModelForCausalLM.from_pretrained(
+                model_id, **model_init_kwargs
+            )
         elif is_peft_model(model):
             # If PEFT is used, the reference model is not needed since the adapter can be disabled
             # to revert to the initial model.
@@ -294,7 +348,9 @@ class FastGRPOTrainer(Trainer):
                 elif isinstance(self.model, PeftModel):
                     _apply_liger_kernel_to_instance(model=self.model.base_model.model)
                 else:
-                    logger.warning("The model is not an instance of PreTrainedModel. No liger kernels will be applied.")
+                    logger.warning(
+                        "The model is not an instance of PreTrainedModel. No liger kernels will be applied."
+                    )
 
                 if self.ref_model is not None:
                     _apply_liger_kernel_to_instance(model=self.ref_model)
@@ -308,13 +364,19 @@ class FastGRPOTrainer(Trainer):
             self.model.add_model_tags(self._tag_names)
 
         # Accelerator prepare
-        self.create_optimizer_and_scheduler(num_training_steps=self.total_steps_per_device)
-        self.model, self.optimizer, self.dataloader = self.accelerator.prepare(self.model, self.optimizer, self.dataloader)
+        self.create_optimizer_and_scheduler(
+            num_training_steps=self.total_steps_per_device
+        )
+        self.model, self.optimizer, self.dataloader = self.accelerator.prepare(
+            self.model, self.optimizer, self.dataloader
+        )
         if self.ref_model is not None:
             if self.is_deepspeed_enabled:
                 self.ref_model = prepare_deepspeed(self.ref_model, self.accelerator)
             else:
-                self.ref_model = self.accelerator.prepare_model(self.ref_model, evaluation_mode=True)
+                self.ref_model = self.accelerator.prepare_model(
+                    self.ref_model, evaluation_mode=True
+                )
 
         # Build vllm rollout
         infer_tp = self.args.vllm_config.tensor_parallel_size
@@ -323,14 +385,22 @@ class FastGRPOTrainer(Trainer):
             self.accelerator.num_processes % infer_tp == 0
         ), f"rollout world_size: {self.accelerator.num_processes} is not divisible by infer_tp: {infer_tp}"
         if dp > 1:
-            rollout_device_mesh = init_device_mesh("cuda", mesh_shape=(dp, infer_tp), mesh_dim_names=["dp", "infer_tp"])
+            rollout_device_mesh = init_device_mesh(
+                "cuda", mesh_shape=(dp, infer_tp), mesh_dim_names=["dp", "infer_tp"]
+            )
         else:
             rollout_device_mesh = None
 
-        self.rollout = vLLMRollout(model_id, self.args.vllm_config, self.processing_class)
+        self.rollout = vLLMRollout(
+            model_id, self.args.vllm_config, self.processing_class
+        )
         logger.info(f"Sampling params: {self.args.vllm_config.sampling_params}")
         self.rollout_sharding_manager = VLLMShardingManager(
-            self.model, self.rollout.inference_engine, self.accelerator, model.config, device_mesh=rollout_device_mesh
+            self.model,
+            self.rollout.inference_engine,
+            self.accelerator,
+            model.config,
+            device_mesh=rollout_device_mesh,
         )
 
         self._memory_tracker.stop_and_update_metrics()
@@ -339,7 +409,9 @@ class FastGRPOTrainer(Trainer):
 
         self.log_completions = args.log_completions
 
-    def _enable_gradient_checkpointing(self, model: PreTrainedModel, args: GRPOConfig) -> PreTrainedModel:
+    def _enable_gradient_checkpointing(
+        self, model: PreTrainedModel, args: GRPOConfig
+    ) -> PreTrainedModel:
         """Enables gradient checkpointing for the model."""
         # Ensure use_cache is disabled
         model.config.use_cache = False
@@ -352,7 +424,10 @@ class FastGRPOTrainer(Trainer):
             model.gradient_checkpointing_enable()
 
         gradient_checkpointing_kwargs = args.gradient_checkpointing_kwargs or {}
-        use_reentrant = "use_reentrant" not in gradient_checkpointing_kwargs or gradient_checkpointing_kwargs["use_reentrant"]
+        use_reentrant = (
+            "use_reentrant" not in gradient_checkpointing_kwargs
+            or gradient_checkpointing_kwargs["use_reentrant"]
+        )
 
         if use_reentrant:
             model.enable_input_require_grads()
@@ -367,13 +442,17 @@ class FastGRPOTrainer(Trainer):
             attention_mask=attention_mask,
             logits_to_keep=logits_to_keep + 1,
         ).logits
-        logits = logits[:, :-1, :]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
+        logits = logits[
+            :, :-1, :
+        ]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
 
         input_ids = input_ids[:, -logits_to_keep:]
         # For transformers<=4.48, logits_to_keep argument isn't supported, so here we drop logits ourselves.
         # See https://github.com/huggingface/trl/issues/2770
         logits = logits[:, -logits_to_keep:]
-        return selective_log_softmax(logits, input_ids)  #  compute logprobs for the input tokens
+        return selective_log_softmax(
+            logits, input_ids
+        )  #  compute logprobs for the input tokens
 
     @profiling_decorator
     @torch.no_grad()
@@ -387,7 +466,10 @@ class FastGRPOTrainer(Trainer):
         self._memory_tracker.start()
 
         prompts = [x["prompt"] for x in batch]
-        prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in batch]
+        prompts_text = [
+            maybe_apply_chat_template(example, self.processing_class)["prompt"]
+            for example in batch
+        ]
         prompt_inputs = self.processing_class(prompts_text, add_special_tokens=False)
         prompt_ids, prompt_mask = (
             prompt_inputs["input_ids"],
@@ -401,21 +483,31 @@ class FastGRPOTrainer(Trainer):
         load_weights = self.state.global_step != self._last_loaded_step
         self.rollout_sharding_manager.load_weights = load_weights
         with self.rollout_sharding_manager:
-            all_prompts_text = self.rollout_sharding_manager.preprocess_data(all_prompts_text)
+            all_prompts_text = self.rollout_sharding_manager.preprocess_data(
+                all_prompts_text
+            )
             completion_ids = self.rollout.generate_sequences(all_prompts_text)
-            completion_ids = self.rollout_sharding_manager.postprocess_data(completion_ids)
+            completion_ids = self.rollout_sharding_manager.postprocess_data(
+                completion_ids
+            )
         self._last_loaded_step = self.state.global_step
 
         # Decode the generated completions
         repeated_prompts = []
         for prompt in prompts:
             repeated_prompts.extend([prompt] * self.args.num_generations)
-        completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
+        completions_text = self.processing_class.batch_decode(
+            completion_ids, skip_special_tokens=True
+        )
         if is_conversational(batch[0]):
             completions = []
             for prompt, completion in zip(repeated_prompts, completions_text):
-                bootstrap = prompt.pop()["content"] if prompt[-1]["role"] == "assistant" else ""
-                completions.append([{"role": "assistant", "content": bootstrap + completion}])
+                bootstrap = (
+                    prompt.pop()["content"] if prompt[-1]["role"] == "assistant" else ""
+                )
+                completions.append(
+                    [{"role": "assistant", "content": bootstrap + completion}]
+                )
         else:
             completions = completions_text
 
@@ -429,12 +521,21 @@ class FastGRPOTrainer(Trainer):
             reward_kwargs = defaultdict(list)
             for example in batch:
                 for key in keys:
-                    reward_kwargs[key].extend([example[key]] * self.args.num_generations)
-            output_reward_func = reward_func(prompts=repeated_prompts, completions=completions, **reward_kwargs)
-            rewards[:, i] = torch.tensor(output_reward_func, dtype=torch.float32) * self.reward_weights[i]
+                    reward_kwargs[key].extend(
+                        [example[key]] * self.args.num_generations
+                    )
+            output_reward_func = reward_func(
+                prompts=repeated_prompts, completions=completions, **reward_kwargs
+            )
+            rewards[:, i] = (
+                torch.tensor(output_reward_func, dtype=torch.float32)
+                * self.reward_weights[i]
+            )
 
         # calculate the advantages, the prompt is all on the same device to no need to gather here
-        grouped_rewards = rewards.sum(dim=1).view(len(prompts), self.args.num_generations)
+        grouped_rewards = rewards.sum(dim=1).view(
+            len(prompts), self.args.num_generations
+        )
         # grouped_advantages = (grouped_rewards - grouped_rewards.mean(-1, keepdim=True)) / (grouped_rewards.std(-1, keepdim=True) + EPS)
         grouped_advantages = grouped_rewards - grouped_rewards.mean(-1, keepdim=True)
         advantages = grouped_advantages.flatten().tolist()
@@ -460,7 +561,10 @@ class FastGRPOTrainer(Trainer):
         return examples
 
     def evaluate(
-        self, eval_dataset: Optional[Dataset] = None, ignore_keys: Optional[list[str]] = None, metric_key_prefix: str = "eval"
+        self,
+        eval_dataset: Optional[Dataset] = None,
+        ignore_keys: Optional[list[str]] = None,
+        metric_key_prefix: str = "eval",
     ) -> dict[str, float]:
         override = eval_dataset is not None
         eval_dataset = eval_dataset if override else self.eval_dataset
@@ -475,7 +579,9 @@ class FastGRPOTrainer(Trainer):
                 metrics.update(dataset_metrics)
             for eval_dataset_name in eval_dataset.keys():
                 for metric_name in ["exact_match", "runtime", "steps"]:
-                    metrics[f"{metric_key_prefix}_{metric_name}"] = metrics.get(f"{metric_key_prefix}_{metric_name}", 0) + metrics.pop(
+                    metrics[f"{metric_key_prefix}_{metric_name}"] = metrics.get(
+                        f"{metric_key_prefix}_{metric_name}", 0
+                    ) + metrics.pop(
                         f"{metric_key_prefix}_{eval_dataset_name}_{metric_name}"
                     )
             return metrics
@@ -496,22 +602,42 @@ class FastGRPOTrainer(Trainer):
         all_labels = []
         with self.rollout_sharding_manager:
             for step, batch in enumerate(eval_dataloader):
-                prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in batch]
-                all_prompts_text = self.rollout_sharding_manager.preprocess_data(prompts_text)
+                prompts_text = [
+                    maybe_apply_chat_template(example, self.processing_class)["prompt"]
+                    for example in batch
+                ]
+                all_prompts_text = self.rollout_sharding_manager.preprocess_data(
+                    prompts_text
+                )
                 # Greedy decoding
-                completion_ids = self.rollout.generate_sequences(all_prompts_text, temperature=0.0, stop="</think>")
-                completion_ids = self.rollout_sharding_manager.postprocess_data(completion_ids)
-                completion_ids = self.gather_function((completion_ids), use_gather_object=True)
+                completion_ids = self.rollout.generate_sequences(
+                    all_prompts_text, temperature=0.0, stop="</think>"
+                )
+                completion_ids = self.rollout_sharding_manager.postprocess_data(
+                    completion_ids
+                )
+                completion_ids = self.gather_function(
+                    (completion_ids), use_gather_object=True
+                )
                 all_preds.extend(completion_ids)
                 # Convert ground truth answer to string
                 labels = [str(example["answer"]) for example in batch]
                 labels = self.gather_function((labels), use_gather_object=True)
                 all_labels.extend(labels)
 
-                self.control = self.callback_handler.on_prediction_step(args, self.state, self.control)
+                self.control = self.callback_handler.on_prediction_step(
+                    args, self.state, self.control
+                )
 
-        decoded_preds = self.processing_class.batch_decode(all_preds, skip_special_tokens=True)
-        output = EvalLoopOutput(predictions=all_preds, label_ids=all_labels, metrics={}, num_samples=len(all_labels))
+        decoded_preds = self.processing_class.batch_decode(
+            all_preds, skip_special_tokens=True
+        )
+        output = EvalLoopOutput(
+            predictions=all_preds,
+            label_ids=all_labels,
+            metrics={},
+            num_samples=len(all_labels),
+        )
 
         # Metrics !
         exact_match = 0
@@ -522,7 +648,9 @@ class FastGRPOTrainer(Trainer):
 
         output.metrics[f"{metric_key_prefix}_exact_match"] = exact_match
         output.metrics[f"{metric_key_prefix}_accuracy"] = exact_match / len(all_labels)
-        output.metrics[f"{metric_key_prefix}_steps"] = math.ceil(len(all_labels) / self.args.eval_batch_size)
+        output.metrics[f"{metric_key_prefix}_steps"] = math.ceil(
+            len(all_labels) / self.args.eval_batch_size
+        )
 
         total_batch_size = self.args.eval_batch_size * self.args.world_size
 
@@ -535,7 +663,9 @@ class FastGRPOTrainer(Trainer):
             )
         )
         self.log(output.metrics)
-        self.control = self.callback_handler.on_evaluate(self.args, self.state, self.control, output.metrics)
+        self.control = self.callback_handler.on_evaluate(
+            self.args, self.state, self.control, output.metrics
+        )
 
         self._memory_tracker.stop_and_update_metrics(output.metrics)
         return output.metrics
@@ -557,12 +687,18 @@ class FastGRPOTrainer(Trainer):
             self.optimizer,
             self.lr_scheduler,
         )
-        self.add_callback(PrinterCallback if self.args.disable_tqdm else DEFAULT_PROGRESS_CALLBACK)
+        self.add_callback(
+            PrinterCallback if self.args.disable_tqdm else DEFAULT_PROGRESS_CALLBACK
+        )
         self.control = TrainerControl()
         self.state = TrainerState(
             is_local_process_zero=self.is_local_process_zero(),
             is_world_process_zero=self.is_world_process_zero(),
-            stateful_callbacks=[cb for cb in self.callback_handler.callbacks + [self.control] if isinstance(cb, ExportableState)],
+            stateful_callbacks=[
+                cb
+                for cb in self.callback_handler.callbacks + [self.control]
+                if isinstance(cb, ExportableState)
+            ],
         )
 
         # Compute absolute values for logging, eval, and save if given as ratio
@@ -590,11 +726,17 @@ class FastGRPOTrainer(Trainer):
         # Train!
         logger.info("***** Running training *****")
         logger.info(f"  Num examples = {self.train_dataset_len:,}")
-        logger.info(f"  Instantaneous batch size per device = {self.args.per_device_train_batch_size:,}")
-        logger.info(f"  Gradient Accumulation steps = {self.args.gradient_accumulation_steps}")
+        logger.info(
+            f"  Instantaneous batch size per device = {self.args.per_device_train_batch_size:,}"
+        )
+        logger.info(
+            f"  Gradient Accumulation steps = {self.args.gradient_accumulation_steps}"
+        )
         logger.info(f"  Number of GRPO iterations = {self.num_iterations}")
         logger.info(f"  Total optimization steps = {self.total_steps_per_device:,}")
-        logger.info(f"  Number of trainable parameters = {get_model_param_count(self.model, trainable_only=True):,}")
+        logger.info(
+            f"  Number of trainable parameters = {get_model_param_count(self.model, trainable_only=True):,}"
+        )
 
         # Set up training state for resuming
         start_step = 1
@@ -604,18 +746,27 @@ class FastGRPOTrainer(Trainer):
         steps_trained_in_current_epoch = 0
 
         # Load training state if available
-        if resume_from_checkpoint is not None and os.path.isfile(os.path.join(resume_from_checkpoint, TRAINER_STATE_NAME)):
-            self.state = TrainerState.load_from_json(os.path.join(resume_from_checkpoint, TRAINER_STATE_NAME))
+        if resume_from_checkpoint is not None and os.path.isfile(
+            os.path.join(resume_from_checkpoint, TRAINER_STATE_NAME)
+        ):
+            self.state = TrainerState.load_from_json(
+                os.path.join(resume_from_checkpoint, TRAINER_STATE_NAME)
+            )
             start_step = self.state.global_step
             self.compare_trainer_and_checkpoint_args(self.args, self.state)
             self._load_callback_state()
             epochs_trained = int(self.state.global_step // self.total_steps_per_device)
-            logger.info("  Continuing training from checkpoint, will skip to saved global_step")
+            logger.info(
+                "  Continuing training from checkpoint, will skip to saved global_step"
+            )
             logger.info(f"  Continuing training from epoch {epochs_trained}")
-            logger.info(f"  Continuing training from global step {self.state.global_step}")
+            logger.info(
+                f"  Continuing training from global step {self.state.global_step}"
+            )
             if not self.args.ignore_data_skip:
                 logger.info(
-                    f"  Will skip the first {epochs_trained} epochs then the first" f" {steps_trained_in_current_epoch} batches in the first epoch."
+                    f"  Will skip the first {epochs_trained} epochs then the first"
+                    f" {steps_trained_in_current_epoch} batches in the first epoch."
                 )
 
         def repeat_generator():
@@ -634,7 +785,9 @@ class FastGRPOTrainer(Trainer):
         self._total_loss_scalar = 0.0
         self._globalstep_last_logged = start_step
         grad_norm: Optional[float] = None
-        self.control = self.callback_handler.on_train_begin(self.args, self.state, self.control)
+        self.control = self.callback_handler.on_train_begin(
+            self.args, self.state, self.control
+        )
 
         for step in range(start_step, self.total_steps_per_device + 1):
             batch = next(iter_dataloader)
@@ -644,14 +797,18 @@ class FastGRPOTrainer(Trainer):
             iteration_losses = []
             iteration_grad_norms = []
             # store the per-token logps for each mini-batch
-            self._buffer = [None] * (len(gen_dataset) // self.args.per_device_train_batch_size)
+            self._buffer = [None] * (
+                len(gen_dataset) // self.args.per_device_train_batch_size
+            )
             for iteration in range(self.num_iterations):
                 mini_batch_dataloader = DataLoader(
                     gen_dataset,
                     batch_size=self.args.per_device_train_batch_size,
                     shuffle=False,
                     drop_last=True,
-                    collate_fn=lambda x: mini_batch_collator(x, self.processing_class, self.args.max_prompt_length),
+                    collate_fn=lambda x: mini_batch_collator(
+                        x, self.processing_class, self.args.max_prompt_length
+                    ),
                 )
                 for idx, mini_batch in enumerate(mini_batch_dataloader):
                     loss = self._optimization_step(mini_batch, idx, iteration + 1)
@@ -663,7 +820,10 @@ class FastGRPOTrainer(Trainer):
                         self.model.parameters(),
                         self.args.max_grad_norm,
                     )
-                if is_accelerate_available() and self.accelerator.distributed_type == DistributedType.DEEPSPEED:
+                if (
+                    is_accelerate_available()
+                    and self.accelerator.distributed_type == DistributedType.DEEPSPEED
+                ):
                     grad_norm = self.model.get_global_grad_norm()
                     # In some cases the grad norm may not return a float
                     if hasattr(grad_norm, "item"):
@@ -690,25 +850,37 @@ class FastGRPOTrainer(Trainer):
             }
             self.log(metrics, start_time)
 
-            self.control = self.callback_handler.on_step_end(self.args, self.state, self.control)
+            self.control = self.callback_handler.on_step_end(
+                self.args, self.state, self.control
+            )
 
             metrics = None
             if self.control.should_evaluate:
                 metrics = self.evaluate(self.eval_dataset)
-                is_new_best_metric = self._determine_best_metric(metrics=metrics, trial=None)
+                is_new_best_metric = self._determine_best_metric(
+                    metrics=metrics, trial=None
+                )
                 if self.args.save_strategy == SaveStrategy.BEST:
                     self.control.should_save = is_new_best_metric
 
             if self.control.should_save:
                 self._save_checkpoint(self.model, trial=None)
-                self.control = self.callback_handler.on_save(self.args, self.state, self.control)
+                self.control = self.callback_handler.on_save(
+                    self.args, self.state, self.control
+                )
 
-        self.control = self.callback_handler.on_train_end(self.args, self.state, self.control)
+        self.control = self.callback_handler.on_train_end(
+            self.args, self.state, self.control
+        )
         if self.control.should_save:
             self._save_checkpoint(self.model, trial=None, metrics=None)
-            self.control = self.callback_handler.on_save(self.args, self.state, self.control)
+            self.control = self.callback_handler.on_save(
+                self.args, self.state, self.control
+            )
 
-        effective_global_step = max(self.state.global_step, 0.001)  # Avoid ZeroDivisionError
+        effective_global_step = max(
+            self.state.global_step, 0.001
+        )  # Avoid ZeroDivisionError
         train_loss = self._total_loss_scalar / effective_global_step
 
         metrics = speed_metrics(
@@ -728,11 +900,20 @@ class FastGRPOTrainer(Trainer):
 
         return TrainOutput(
             self.state.global_step,
-            tr_loss.item() / self.state.global_step if self.state.global_step > 0 else 0.0,
-            {k: sum(v) / len(v) if v else 0.0 for k, v in self._metrics["train"].items()},
+            (
+                tr_loss.item() / self.state.global_step
+                if self.state.global_step > 0
+                else 0.0
+            ),
+            {
+                k: sum(v) / len(v) if v else 0.0
+                for k, v in self._metrics["train"].items()
+            },
         )
 
-    def _optimization_step(self, mini_batch: dict[str, torch.Tensor | list[str]], idx: int, iteration: int):
+    def _optimization_step(
+        self, mini_batch: dict[str, torch.Tensor | list[str]], idx: int, iteration: int
+    ):
         device = self.accelerator.device
         prompts = mini_batch.pop("prompts")
         mini_batch = {k: v.to(device) for k, v in mini_batch.items()}
@@ -769,7 +950,6 @@ class FastGRPOTrainer(Trainer):
                 attention_mask,
                 logits_to_keep,
             )
-            per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
             old_per_token_logps = self._buffer[idx]
             if old_per_token_logps is None:
                 old_per_token_logps = per_token_logps.detach()
@@ -779,46 +959,91 @@ class FastGRPOTrainer(Trainer):
             per_token_loss1 = coef_1 * advantages
             per_token_loss2 = coef_2 * advantages
             per_token_loss = torch.min(per_token_loss1, per_token_loss2)
-            per_token_loss = -(per_token_loss - self.args.beta * per_token_kl)
-            # loss = (per_token_loss * completion_mask).sum() / completion_mask.sum()
-            loss = (per_token_loss * completion_mask).sum() / (per_token_loss.size(0) * self.max_completion_length)
+            if self.ref_model is not None:
+                per_token_kl = (
+                    torch.exp(ref_per_token_logps - per_token_logps)
+                    - (ref_per_token_logps - per_token_logps)
+                    - 1
+                )
+                per_token_loss = -(per_token_loss - self.args.beta * per_token_kl)
+            else:
+                per_token_loss = -per_token_loss
+            loss = (per_token_loss * completion_mask).sum() / (
+                per_token_loss.size(0) * self.max_completion_length
+            )
             is_clipped = (per_token_loss1 < per_token_loss2).float()
             clip_ratio = (is_clipped * completion_mask).sum() / completion_mask.sum()
-            mean_kl = (per_token_kl * completion_mask).sum() / completion_mask.sum()
+            if self.ref_model is not None:
+                mean_kl = (per_token_kl * completion_mask).sum() / completion_mask.sum()
+            else:
+                mean_kl = torch.tensor([0.0], device=device)
             self.accelerator.backward(loss)
             # Run callbacks and optimizer steps
-            self.control = self.callback_handler.on_pre_optimizer_step(self.args, self.state, self.control)
+            self.control = self.callback_handler.on_pre_optimizer_step(
+                self.args, self.state, self.control
+            )
             self.optimizer.step()
-            self.control = self.callback_handler.on_optimizer_step(self.args, self.state, self.control)
+            self.control = self.callback_handler.on_optimizer_step(
+                self.args, self.state, self.control
+            )
             self.optimizer.zero_grad()
 
         # Log the metrics
         with torch.no_grad():
-            completion_length = self.accelerator.gather_for_metrics(completion_mask.sum(1)).float().mean().item()
-            min_completion_length = self.accelerator.gather_for_metrics(completion_mask.sum(1)).float().min().item()
-            max_completion_length = self.accelerator.gather_for_metrics(completion_mask.sum(1)).float().max().item()
+            completion_length = (
+                self.accelerator.gather_for_metrics(completion_mask.sum(1))
+                .float()
+                .mean()
+                .item()
+            )
+            min_completion_length = (
+                self.accelerator.gather_for_metrics(completion_mask.sum(1))
+                .float()
+                .min()
+                .item()
+            )
+            max_completion_length = (
+                self.accelerator.gather_for_metrics(completion_mask.sum(1))
+                .float()
+                .max()
+                .item()
+            )
             self._metrics["train"]["completion_length"].append(completion_length)
-            self._metrics["train"]["min_completion_length"].append(min_completion_length)
-            self._metrics["train"]["max_completion_length"].append(max_completion_length)
+            self._metrics["train"]["min_completion_length"].append(
+                min_completion_length
+            )
+            self._metrics["train"]["max_completion_length"].append(
+                max_completion_length
+            )
             rewards = self.accelerator.gather_for_metrics(rewards)
             rewards_per_func = rewards.mean(0)
             for i, reward_func in enumerate(self.reward_funcs):
-                if isinstance(reward_func, torch.nn.Module):  # Module instead of PretrainedModel for compat with compiled models
+                if isinstance(
+                    reward_func, torch.nn.Module
+                ):  # Module instead of PretrainedModel for compat with compiled models
                     reward_func_name = reward_func.config._name_or_path.split("/")[-1]
                 else:
                     reward_func_name = reward_func.__name__
-                self._metrics["train"][f"rewards/{reward_func_name}"].append(rewards_per_func[i].item())
+                self._metrics["train"][f"rewards/{reward_func_name}"].append(
+                    rewards_per_func[i].item()
+                )
             rewards = rewards.sum(dim=1)
             self._metrics["train"]["rewards"].append(rewards.mean().item())
             self._metrics["train"]["rewards_std"].append(rewards.std().item())
-            self._metrics["train"]["clip_ratio"].append(self.accelerator.gather_for_metrics(clip_ratio).mean().item())
-            self._metrics["train"]["kl"].append(self.accelerator.gather_for_metrics(mean_kl).mean().item())
+            self._metrics["train"]["clip_ratio"].append(
+                self.accelerator.gather_for_metrics(clip_ratio).mean().item()
+            )
+            self._metrics["train"]["kl"].append(
+                self.accelerator.gather_for_metrics(mean_kl).mean().item()
+            )
 
         return loss.detach()
 
     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
         mode = "eval" if self.control.should_evaluate else "train"
-        metrics = {key: sum(val) / len(val) for key, val in self._metrics[mode].items()}  # average the metrics
+        metrics = {
+            key: sum(val) / len(val) for key, val in self._metrics[mode].items()
+        }  # average the metrics
 
         # This method can be called both in training and evaluation. When called in evaluation, the keys in `logs`
         # start with "eval_". We need to add the prefix "eval_" to the keys in `metrics` to match the format.
