@@ -1,21 +1,16 @@
-import argparse
 import os
-import gc
 import time
 import warnings
 import pandas as pd
 import numpy as np
 import torch
 import re
-import keyword
 from collections import Counter
 import random
 from vllm import LLM, SamplingParams
-from transformers import AutoTokenizer, PreTrainedTokenizer
+from transformers import AutoTokenizer
 
-# from open_r1.rewards import answer_parser
 from sympy import simplify
-import sys
 from fire import Fire
 from openai import OpenAI
 
@@ -31,23 +26,6 @@ def seed_everything(seed):
 
 
 seed_everything(seed=3407)
-
-
-sys.set_int_max_str_digits(1000000)
-
-
-def create_starter_messages(question: str) -> list[dict]:
-    messages = [
-        {
-            "role": "system",
-            "content": "You are a helpful AI Assistant, designed to provided well-reasoned and detailed responses. You FIRST think about the reasoning process as an internal monologue and then provide the user with the answer. The reasoning process MUST BE enclosed within <think> and </think> tags.",
-        },
-        {
-            "role": "user",
-            "content": question + "\nPlease put the final answer within \\boxed{}.",
-        },
-    ]
-    return messages
 
 
 def extract_boxed_text(text):
@@ -88,23 +66,37 @@ def select_answer(answers: list[str], scores: list[float]) -> int:
     return str(answer)
 
 
-def get_rewards(prm: OpenAI, prm_tokenizer: AutoTokenizer, question: str, output_texts: list[str]) -> list[float]:
+def get_rewards(
+    prm: OpenAI, prm_tokenizer: AutoTokenizer, question: str, output_texts: list[str]
+) -> list[float]:
     rm_prompts = []
     for text in output_texts:
         rm_messages = [
-            {"role": "system", "content": "Please reason step by step, and put your final answer within \\boxed{}."},
+            {
+                "role": "system",
+                "content": "Please reason step by step, and put your final answer within \\boxed{}.",
+            },
             {"role": "user", "content": question},
-            {"role": "assistant", "content": "<extra_0>".join(text.split("\n\n")) + "<extra_0>"},
+            {
+                "role": "assistant",
+                "content": "<extra_0>".join(text.split("\n\n")) + "<extra_0>",
+            },
         ]
         rm_prompt = prm_tokenizer.apply_chat_template(
-            conversation=rm_messages, tokenize=True, add_generation_prompt=False, max_length=4096, truncation=True
+            conversation=rm_messages,
+            tokenize=True,
+            add_generation_prompt=False,
+            max_length=4096,
+            truncation=True,
         )
         rm_prompts.append(rm_prompt)
     prm_outputs = prm.embeddings.create(
         input=rm_prompts,
         model=prm.models.list().data[0].id,
     )
-    all_probs = [np.array(output.embedding).reshape(-1, 2) for output in prm_outputs.data]
+    all_probs = [
+        np.array(output.embedding).reshape(-1, 2) for output in prm_outputs.data
+    ]
     all_rewards = []
     for step_probs in all_probs:
         step_probs = step_probs[:, 1]
@@ -122,6 +114,8 @@ def predict_for_question(
     ground_truth: int,
     max_num_seqs: int,
     max_model_len: int,
+    turn_1_max_tokens: int = 3072,
+    num_seqs_to_keep: int = 16,
 ) -> tuple[int, list[str]]:
     if time.time() > cutoff_time:
         return 210, []
@@ -132,14 +126,10 @@ def predict_for_question(
         num_seqs = 2 * max_num_seqs // 3
 
     start = time.time()
-    turn_1_max_tokens = 3584
-    num_seqs_to_keep = 16
     stop = None
     sampling_kwargs = {
         "temperature": 0.6,
         "min_p": 0.05,
-        "top_p": 0.95,
-        "repetition_penalty": 1.05,
         "skip_special_tokens": True,
         "seed": 3407,
     }
@@ -151,14 +141,19 @@ def predict_for_question(
         },
         {
             "role": "user",
-            "content": question + "\nPlease put the final answer within \\boxed{}, after taking modulo 1000.",
+            "content": question
+            + "\nPlease put the final answer within \\boxed{}, after taking modulo 1000.",
         },
     ]
-    prompt_ids = tokenizer.apply_chat_template(conversation=messages, tokenize=True, add_generation_prompt=True)
+    prompt_ids = tokenizer.apply_chat_template(
+        conversation=messages, tokenize=True, add_generation_prompt=True
+    )
 
     request_output = llm.generate(
         prompt_token_ids=[prompt_ids],
-        sampling_params=SamplingParams(**sampling_kwargs, max_tokens=turn_1_max_tokens, n=num_seqs, stop=stop),
+        sampling_params=SamplingParams(
+            **sampling_kwargs, max_tokens=turn_1_max_tokens, n=num_seqs, stop=stop
+        ),
     )
     output_texts = [output.text for output in request_output[0].outputs]
     all_rewards = get_rewards(prm, prm_tokenizer, question, output_texts)
@@ -167,28 +162,43 @@ def predict_for_question(
     sorted_idxs = np.argsort(all_rewards)[::-1][:num_seqs_to_keep]
     remaining_prompts_ids = []
     for idx in sorted_idxs:
-        remaining_prompts_ids.append(prompt_ids + list(request_output[0].outputs[idx].token_ids))
+        remaining_prompts_ids.append(
+            prompt_ids + list(request_output[0].outputs[idx].token_ids)
+        )
     remaining_outputs = llm.generate(
         prompt_token_ids=remaining_prompts_ids,
-        sampling_params=SamplingParams(**sampling_kwargs, max_tokens=max_model_len - turn_1_max_tokens, stop="</think>"),
+        sampling_params=SamplingParams(
+            **sampling_kwargs,
+            max_tokens=max_model_len - turn_1_max_tokens - len(prompt_ids),
+            stop="</think>",
+        ),
     )
     lengths = []
     all_extracted_answers = []
     predictions = []
     for idx, output in zip(sorted_idxs, remaining_outputs):
-        completion_text = request_output[0].outputs[idx].text + " " + output.outputs[0].text
-        completion_ids = list(request_output[0].outputs[idx].token_ids) + list(output.outputs[0].token_ids)
+        completion_text = (
+            request_output[0].outputs[idx].text + " " + output.outputs[0].text
+        )
+        completion_ids = list(request_output[0].outputs[idx].token_ids) + list(
+            output.outputs[0].token_ids
+        )
         answer = extract_boxed_text(completion_text)
         if answer:
             all_extracted_answers.append(answer)
             predictions.append(completion_text)
             lengths.append(len(completion_ids))
+
     # re-calculate rewards, then select answer with highest total reward
     if len(predictions) > 0:
         all_rewards = get_rewards(prm, prm_tokenizer, question, predictions)
         answer = select_answer(all_extracted_answers, all_rewards)
-        print(f"Max length: {max(lengths)}, Min length: {min(lengths)}, Mean length: {sum(lengths) / len(lengths)}")
-        print(f"Candidates: {[(answer, reward) for answer, reward in zip(all_extracted_answers, all_rewards)]}")
+        print(
+            f"Max length: {max(lengths)}, Min length: {min(lengths)}, Mean length: {sum(lengths) / len(lengths)}"
+        )
+        print(
+            f"Candidates: {[(answer, reward) for answer, reward in zip(all_extracted_answers, all_rewards)]}"
+        )
     else:
         answer = 210
         print(f"No prediction contains \\boxed{{}}, using 210 as answer")
@@ -214,6 +224,8 @@ def predict(
     ground_truth,
     max_num_seqs,
     max_model_len,
+    turn_1_max_tokens: int = 3072,
+    num_seqs_to_keep: int = 16,
 ):
     print(f"ID: {id_} | Question: {question}")
     answer, predictions = predict_for_question(
@@ -226,6 +238,8 @@ def predict(
         ground_truth,
         max_num_seqs,
         max_model_len,
+        turn_1_max_tokens,
+        num_seqs_to_keep,
     )
     print("=" * 80)
     return answer, predictions
@@ -244,7 +258,9 @@ warnings.simplefilter("ignore")
 
 def main(
     llm_model_pth: str,
-    max_num_seqs: int = 4,
+    max_num_seqs: int = 40,
+    turn_1_max_tokens: int = 3072,
+    num_seqs_to_keep: int = 16,
     max_model_len: int = 12282,
     csv_file: str = "~/open-r1/reference-aime-hmmt.csv",
     output_file: str = "~/open-r1/generation/output.csv",
@@ -288,6 +304,8 @@ def main(
             row["answer"],
             max_num_seqs,
             max_model_len,
+            turn_1_max_tokens,
+            num_seqs_to_keep,
         )
         results.append(result)
         predictions_list.append(predictions)
