@@ -91,6 +91,7 @@ from trl.trainer.utils import (
 )
 
 if is_accelerate_available():
+    from accelerate import skip_first_batches
     from accelerate.utils import DistributedType, is_peft_model, set_seed
     from accelerate.utils.other import is_compiled_module
 
@@ -768,6 +769,14 @@ class FastGRPOTrainer(Trainer):
                     f"  Will skip the first {epochs_trained} epochs then the first"
                     f" {steps_trained_in_current_epoch} batches in the first epoch."
                 )
+        if start_step > 1:
+            num_update_steps_per_epoch = math.ceil(
+                self.train_dataset_len
+                / (self.local_dataloader_batch_size * self.accelerator.num_processes)
+            )
+            self.dataloader = skip_first_batches(
+                self.dataloader, (start_step - 1) % num_update_steps_per_epoch
+            )
 
         def repeat_generator():
             while True:
