@@ -207,6 +207,7 @@ def predict_for_question(
     print(f"Final answer: {answer} - Ground truth: {ground_truth}")
 
     cutoff_times.pop()
+    llm.reset_prefix_cache()
     return answer, predictions
 
 
@@ -276,7 +277,7 @@ def main(
         llm_model_pth,
         quantization=quantization,
         max_num_seqs=max_num_seqs,  # Maximum number of sequences per iteration. Default is 256
-        max_model_len=max_model_len,  # Model context length
+        max_model_len=max_model_len + 512,  # Model context length
         trust_remote_code=True,  # Trust remote code (e.g., from HuggingFace) when downloading the model and tokenizer
         tensor_parallel_size=torch.cuda.device_count(),  # The number of GPUs to use for distributed execution with tensor parallelism
         gpu_memory_utilization=0.9,  # The ratio (between 0 and 1) of GPU memory to reserve for the model
