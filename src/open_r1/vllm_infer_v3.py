@@ -10,9 +10,11 @@ import random
 from vllm import LLM, SamplingParams
 from transformers import AutoTokenizer
 
+from math_verify import verify
 from sympy import simplify
 from fire import Fire
 from openai import OpenAI
+from open_r1.rewards import answer_parser
 
 
 def seed_everything(seed):
@@ -29,14 +31,14 @@ seed_everything(seed=3407)
 
 
 def extract_boxed_text(text):
-    pattern = r"oxed{(.*?)}"
-    matches = re.findall(pattern, text)
-    if not matches:
-        return ""
-    for match in matches[::-1]:
-        if match != "":
-            return match
-    return ""
+    # pattern = r"oxed{(.*?)}"
+    # matches = re.findall(pattern, text)
+    # if not matches:
+    #     return ""
+    # for match in matches[::-1]:
+    #     if match != "":
+    #         return match
+    # return ""
     parsed = answer_parser(text)
     try:
         parsed = simplify(parsed[0])
@@ -67,10 +69,15 @@ def select_answer(answers: list[str], scores: list[float]) -> int:
 
 
 def get_rewards(
-    prm: OpenAI, prm_tokenizer: AutoTokenizer, question: str, output_texts: list[str]
+    prm: OpenAI,
+    prm_tokenizer: AutoTokenizer,
+    question: str,
+    output_texts: list[str],
 ) -> list[float]:
     rm_prompts = []
     for text in output_texts:
+        tokenized = prm_tokenizer.encode(text, add_special_tokens=False)
+        text = "(...)\n" + prm_tokenizer.decode(tokenized[-4096:])
         rm_messages = [
             {
                 "role": "system",
@@ -122,14 +129,12 @@ def predict_for_question(
 
     num_seqs = max_num_seqs
 
-    if time.time() > cutoff_times[-1]:
-        num_seqs = 2 * max_num_seqs // 3
-
     start = time.time()
     stop = None
     sampling_kwargs = {
         "temperature": 0.6,
         "min_p": 0.05,
+        "top_p": 0.95,
         "skip_special_tokens": True,
         "seed": 3407,
     }
@@ -160,34 +165,61 @@ def predict_for_question(
 
     # sort by rewards, infer top num_seqs_to_keep sequences
     sorted_idxs = np.argsort(all_rewards)[::-1][:num_seqs_to_keep]
-    remaining_prompts_ids = []
-    for idx in sorted_idxs:
-        remaining_prompts_ids.append(
-            prompt_ids + list(request_output[0].outputs[idx].token_ids)
-        )
-    remaining_outputs = llm.generate(
-        prompt_token_ids=remaining_prompts_ids,
-        sampling_params=SamplingParams(
-            **sampling_kwargs,
-            max_tokens=max_model_len - turn_1_max_tokens - len(prompt_ids),
-            stop="</think>",
-        ),
+    sorted_rewards = [all_rewards[idx] for idx in sorted_idxs]
+    total_remaining_tokens = max_model_len * num_seqs_to_keep - sum(
+        [len(output.token_ids) for output in request_output[0].outputs]
     )
+    min_tokens = 256
+    alpha, beta = 2.0, 1.0
+    min_reward, max_reward = min(sorted_rewards), max(sorted_rewards)
+    reward_range = max_reward - min_reward
+    normalized_rewards = [(r - min_reward) / reward_range for r in sorted_rewards]
+    # Sample from beta distributions influenced by rewards
+    samples = []
+    for r in normalized_rewards:
+        # Higher reward -> higher alpha -> more likely to sample high values
+        samples.append(np.random.beta(alpha + r * 10, beta))
+    sample_sum = sum(samples)
+    token_budgets = [
+        max(min_tokens, int(total_remaining_tokens * s / sample_sum)) for s in samples
+    ]
+    print(token_budgets)
+
+    prompts_ids = []
+    sampling_params = []
+    predictions = []
+    for idx, budget in zip(sorted_idxs, token_budgets):
+        prompts_ids.append(prompt_ids + list(request_output[0].outputs[idx].token_ids))
+        sampling_params.append(
+            SamplingParams(
+                **sampling_kwargs,
+                max_tokens=budget,
+                stop="</think>",
+            )
+        )
+    parsed_prompts = llm._convert_v1_inputs(None, prompts_ids)
+    for idx, prompt, params in zip(sorted_idxs, parsed_prompts, sampling_params):
+        request_id = str(idx)
+        llm.llm_engine.add_request(
+            request_id, prompt, params, lora_request=None, prompt_adapter_request=None
+        )
+
+    predictions = []
     lengths = []
     all_extracted_answers = []
-    predictions = []
-    for idx, output in zip(sorted_idxs, remaining_outputs):
-        completion_text = (
-            request_output[0].outputs[idx].text + " " + output.outputs[0].text
-        )
-        completion_ids = list(request_output[0].outputs[idx].token_ids) + list(
-            output.outputs[0].token_ids
-        )
-        answer = extract_boxed_text(completion_text)
-        if answer:
-            all_extracted_answers.append(answer)
-            predictions.append(completion_text)
-            lengths.append(len(completion_ids))
+    while llm.llm_engine.has_unfinished_requests():
+        if time.time() + 5 > cutoff_times[-1]:
+            break
+        step_outputs = llm.llm_engine.step()
+        for output in step_outputs:
+            if output.finished:
+                completion_text = request_output[0].outputs[int(output.request_id)].text
+                completion_text += output.outputs[0].text
+                answer = extract_boxed_text(completion_text)
+                if answer:
+                    all_extracted_answers.append(answer)
+                    predictions.append(completion_text)
+                    lengths.append(len(output.token_ids))
 
     # re-calculate rewards, then select answer with highest total reward
     if len(predictions) > 0:
@@ -196,6 +228,7 @@ def predict_for_question(
         print(
             f"Max length: {max(lengths)}, Min length: {min(lengths)}, Mean length: {sum(lengths) / len(lengths)}"
         )
+        print(f"Number of predictions: {len(predictions)}")
         print(
             f"Candidates: {[(answer, reward) for answer, reward in zip(all_extracted_answers, all_rewards)]}"
         )
@@ -252,8 +285,8 @@ pd.set_option("display.max_colwidth", None)
 start_time = time.time()
 cutoff_time = start_time + (4 * 60 + 45) * 60
 cutoff_times = [int(x) for x in np.linspace(cutoff_time, start_time + 6 * 60, 50 + 1)]
-print(time.ctime(start_time))
-print([time.ctime(x) for x in cutoff_times])
+# print(time.ctime(start_time))
+# print([time.ctime(x) for x in cutoff_times])
 warnings.simplefilter("ignore")
 
 
@@ -313,7 +346,8 @@ def main(
     df["prediction"] = results
     df["generations"] = predictions_list
     # Calculate accuracy
-    df["correct"] = df["prediction"] == df["answer"]
+    # df["correct"] = df["prediction"] == df["answer"]
+    df["correct"] = df.apply(lambda x: verify(x["prediction"], x["answer"]), axis=1)
     accuracy = df["correct"].mean()
     print(f"Accuracy: {accuracy:.4f}")
     time_taken = time.time() - start_time
