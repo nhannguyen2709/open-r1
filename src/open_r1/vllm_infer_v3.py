@@ -116,6 +116,7 @@ def predict_for_question(
     tokenizer: AutoTokenizer,
     prm: OpenAI,
     prm_tokenizer: AutoTokenizer,
+    cutoff_time: int,
     cutoff_times: list[int],
     question: str,
     ground_truth: int,
@@ -178,11 +179,13 @@ def predict_for_question(
     samples = []
     for r in normalized_rewards:
         # Higher reward -> higher alpha -> more likely to sample high values
-        samples.append(np.random.beta(alpha + r * 10, beta))
+        adjusted_alpha = alpha + r**2 * 20
+        adjusted_beta = max(0.5, beta - r * 0.5)
+        samples.append(np.random.beta(adjusted_alpha, adjusted_beta))
     sample_sum = sum(samples)
-    token_budgets = [
-        max(min_tokens, int(total_remaining_tokens * s / sample_sum)) for s in samples
-    ]
+    token_budgets = sorted(
+        [max(min_tokens, int(total_remaining_tokens * s / sample_sum)) for s in samples]
+    )[::-1]
     print(token_budgets)
 
     prompts_ids = []
@@ -198,6 +201,7 @@ def predict_for_question(
             )
         )
     parsed_prompts = llm._convert_v1_inputs(None, prompts_ids)
+    request_ids = [str(idx) for idx in sorted_idxs]
     for idx, prompt, params in zip(sorted_idxs, parsed_prompts, sampling_params):
         request_id = str(idx)
         llm.llm_engine.add_request(
@@ -213,13 +217,17 @@ def predict_for_question(
         step_outputs = llm.llm_engine.step()
         for output in step_outputs:
             if output.finished:
+                length = len(
+                    request_output[0].outputs[int(output.request_id)].token_ids
+                )
                 completion_text = request_output[0].outputs[int(output.request_id)].text
                 completion_text += output.outputs[0].text
                 answer = extract_boxed_text(completion_text)
                 if answer:
+                    request_ids.remove(output.request_id)
                     all_extracted_answers.append(answer)
                     predictions.append(completion_text)
-                    lengths.append(len(output.token_ids))
+                    lengths.append(length + len(output.outputs[0].token_ids))
 
     # re-calculate rewards, then select answer with highest total reward
     if len(predictions) > 0:
@@ -239,8 +247,10 @@ def predict_for_question(
     print(f"Time taken: {time.time() - start:.2f} seconds")
     print(f"Final answer: {answer} - Ground truth: {ground_truth}")
 
-    cutoff_times.pop()
+    for request_id in request_ids:
+        llm.llm_engine.abort_request(request_id)
     llm.reset_prefix_cache()
+    cutoff_times.pop()
     return answer, predictions
 
 
@@ -252,6 +262,7 @@ def predict(
     tokenizer,
     prm,
     prm_tokenizer,
+    cutoff_time,
     cutoff_times,
     id_,
     question,
@@ -267,6 +278,7 @@ def predict(
         tokenizer,
         prm,
         prm_tokenizer,
+        cutoff_time,
         cutoff_times,
         question,
         ground_truth,
@@ -282,11 +294,6 @@ def predict(
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 pd.set_option("display.max_colwidth", None)
-start_time = time.time()
-cutoff_time = start_time + (4 * 60 + 45) * 60
-cutoff_times = [int(x) for x in np.linspace(cutoff_time, start_time + 6 * 60, 50 + 1)]
-# print(time.ctime(start_time))
-# print([time.ctime(x) for x in cutoff_times])
 warnings.simplefilter("ignore")
 
 
@@ -302,8 +309,10 @@ def main(
 ):
     df = pd.read_csv(csv_file)
     df = df.rename(columns={"problem": "question"})
+    df = df.sample(n=len(df)).reset_index(drop=True)
     df["answer"] = df["answer"].astype(str)
 
+    prm = OpenAI(base_url="http://localhost:8000/v1", api_key="NVIDIA")
     prm = OpenAI(base_url="http://localhost:8000/v1", api_key="NVIDIA")
     prm_tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-Math-PRM-7B")
     llm = LLM(
@@ -315,10 +324,25 @@ def main(
         tensor_parallel_size=torch.cuda.device_count(),  # The number of GPUs to use for distributed execution with tensor parallelism
         gpu_memory_utilization=0.9,  # The ratio (between 0 and 1) of GPU memory to reserve for the model
         seed=3407,
-        enforce_eager=False,
+        enforce_eager=True,
         enable_prefix_caching=True,
         enable_chunked_prefill=True,
     )
+
+    # H100 is ~ 3x faster than L4
+    num_hours = (5 / 3) * len(df) / 50
+    mins_per_question = 6 // 3
+    start_time = time.time()
+    cutoff_time = start_time + num_hours * 60 * 60
+    cutoff_times = [
+        int(x)
+        for x in np.linspace(
+            cutoff_time, start_time + mins_per_question * 60, len(df) + 1
+        )
+    ]
+    print(f"Start @ {time.ctime(start_time)}")
+    print([time.ctime(x) for x in cutoff_times])
+    print(f"Cutoff @ {time.ctime(cutoff_time)}")
 
     tokenizer = llm.get_tokenizer()
 
@@ -332,6 +356,7 @@ def main(
             tokenizer,
             prm,
             prm_tokenizer,
+            cutoff_time,
             cutoff_times,
             row["id"],
             row["question"],
