@@ -166,46 +166,23 @@ def predict_for_question(
 
     # sort by rewards, infer top num_seqs_to_keep sequences
     sorted_idxs = np.argsort(all_rewards)[::-1][:num_seqs_to_keep]
-    sorted_rewards = [all_rewards[idx] for idx in sorted_idxs]
-    total_remaining_tokens = max_model_len * num_seqs_to_keep - sum(
-        [len(output.token_ids) for output in request_output[0].outputs]
-    )
-    min_tokens = 256
-    alpha, beta = 2.0, 1.0
-    min_reward, max_reward = min(sorted_rewards), max(sorted_rewards)
-    reward_range = max_reward - min_reward
-    normalized_rewards = [(r - min_reward) / reward_range for r in sorted_rewards]
-    # Sample from beta distributions influenced by rewards
-    samples = []
-    for r in normalized_rewards:
-        # Higher reward -> higher alpha -> more likely to sample high values
-        adjusted_alpha = alpha + r**2 * 20
-        adjusted_beta = max(0.5, beta - r * 0.5)
-        samples.append(np.random.beta(adjusted_alpha, adjusted_beta))
-    sample_sum = sum(samples)
-    token_budgets = sorted(
-        [max(min_tokens, int(total_remaining_tokens * s / sample_sum)) for s in samples]
-    )[::-1]
-    print(token_budgets)
-
     prompts_ids = []
-    sampling_params = []
-    predictions = []
-    for idx, budget in zip(sorted_idxs, token_budgets):
+    for idx in sorted_idxs:
         prompts_ids.append(prompt_ids + list(request_output[0].outputs[idx].token_ids))
-        sampling_params.append(
-            SamplingParams(
-                **sampling_kwargs,
-                max_tokens=budget,
-                stop="</think>",
-            )
-        )
     parsed_prompts = llm._convert_v1_inputs(None, prompts_ids)
     request_ids = [str(idx) for idx in sorted_idxs]
-    for idx, prompt, params in zip(sorted_idxs, parsed_prompts, sampling_params):
+    for idx, prompt in zip(sorted_idxs, parsed_prompts):
         request_id = str(idx)
         llm.llm_engine.add_request(
-            request_id, prompt, params, lora_request=None, prompt_adapter_request=None
+            request_id,
+            prompt,
+            SamplingParams(
+                **sampling_kwargs,
+                max_tokens=max_model_len - turn_1_max_tokens,
+                stop="</think>",
+            ),
+            lora_request=None,
+            prompt_adapter_request=None,
         )
 
     predictions = []
@@ -324,7 +301,7 @@ def main(
         tensor_parallel_size=torch.cuda.device_count(),  # The number of GPUs to use for distributed execution with tensor parallelism
         gpu_memory_utilization=0.9,  # The ratio (between 0 and 1) of GPU memory to reserve for the model
         seed=3407,
-        enforce_eager=True,
+        enforce_eager=False,
         enable_prefix_caching=True,
         enable_chunked_prefill=True,
     )
